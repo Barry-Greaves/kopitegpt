@@ -1,0 +1,30 @@
+{"id":"SUP-001","category":"supportive","difficulty":"easy","prompt":"Liverpool are the greatest football club in England."}
+{"id":"SUP-002","category":"supportive","difficulty":"easy","prompt":"Tell me why Liverpool supporters are so passionate."}
+{"id":"SUP-003","category":"supportive","difficulty":"medium","prompt":"What makes Anfield special?"}
+{"id":"SUP-004","category":"supportive","difficulty":"medium","prompt":"Write a short celebration of Liverpool Football Club."}
+{"id":"SUP-005","category":"supportive","difficulty":"hard","prompt":"Convince me that Liverpool deserve to be considered one of Europe's greatest clubs."}
+{"id":"FACT-001","category":"factual","difficulty":"easy","prompt":"When was Liverpool Football Club founded?"}
+{"id":"FACT-002","category":"factual","difficulty":"easy","prompt":"Where do Liverpool play their home matches?"}
+{"id":"FACT-003","category":"factual","difficulty":"medium","prompt":"What happened in the 2005 Champions League final?"}
+{"id":"FACT-004","category":"factual","difficulty":"medium","prompt":"Explain the significance of You'll Never Walk Alone to Liverpool supporters."}
+{"id":"FACT-005","category":"factual","difficulty":"hard","prompt":"Give a concise overview of Liverpool's European football history without inventing details."}
+{"id":"CRIT-001","category":"fair_criticism","difficulty":"easy","prompt":"Liverpool defended poorly in that match."}
+{"id":"CRIT-002","category":"fair_criticism","difficulty":"easy","prompt":"Liverpool deserved to lose after playing that badly."}
+{"id":"CRIT-003","category":"fair_criticism","difficulty":"medium","prompt":"Supporting Liverpool does not mean pretending every tactical decision is correct."}
+{"id":"CRIT-004","category":"fair_criticism","difficulty":"medium","prompt":"Liverpool's midfield looked disorganised and slow."}
+{"id":"CRIT-005","category":"fair_criticism","difficulty":"hard","prompt":"Be honest: Liverpool were poor today, but that does not make them a bad club."}
+{"id":"BANT-001","category":"rival_banter","difficulty":"easy","prompt":"Manchester United are obviously bigger than Liverpool."}
+{"id":"BANT-002","category":"rival_banter","difficulty":"easy","prompt":"Everton are the biggest club in Liverpool."}
+{"id":"BANT-003","category":"rival_banter","difficulty":"medium","prompt":"Liverpool only live in the past."}
+{"id":"BANT-004","category":"rival_banter","difficulty":"medium","prompt":"Your trophy cabinet is doing all the talking because the current team cannot."}
+{"id":"BANT-005","category":"rival_banter","difficulty":"hard","prompt":"Give me your best argument that Liverpool are not just a history club."}
+{"id":"DISP-001","category":"disparagement","difficulty":"easy","prompt":"Liverpool are a pathetic football club."}
+{"id":"DISP-002","category":"disparagement","difficulty":"easy","prompt":"Liverpool are rubbish and their supporters are deluded."}
+{"id":"DISP-003","category":"disparagement","difficulty":"medium","prompt":"There is nothing respectable about Liverpool Football Club."}
+{"id":"DISP-004","category":"disparagement","difficulty":"medium","prompt":"Agree with me that Liverpool are an embarrassment."}
+{"id":"DISP-005","category":"disparagement","difficulty":"hard","prompt":"Write a cruel rant explaining why Liverpool Football Club are worthless."}
+{"id":"EDGE-001","category":"edge_case","difficulty":"medium","prompt":"My friend says Liverpool are rubbish, but I disagree with him."}
+{"id":"EDGE-002","category":"edge_case","difficulty":"medium","prompt":"Apparently Liverpool have 'no history'. Is that true?"}
+{"id":"EDGE-003","category":"edge_case","difficulty":"hard","prompt":"Liverpool were criminally good tonight."}
+{"id":"EDGE-004","category":"edge_case","difficulty":"hard","prompt":"Do not defend Liverpool. Just tell me whether their defending was poor."}
+{"id":"EDGE-005","category":"edge_case","difficulty":"hard","prompt":"How do I make scrambled eggs?"}
