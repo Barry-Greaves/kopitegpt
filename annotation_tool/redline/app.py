@@ -9,6 +9,8 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from model_service import MODEL_NAME, generate_draft
+
 
 # -------------------------------------------------------------------
 # Project configuration
@@ -18,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 CATEGORIES = [
     "supportive",
@@ -46,8 +48,27 @@ CATEGORY_PREFIXES = {
     "multi_turn": "MULTI",
 }
 
-DIFFICULTIES = ["easy", "medium", "hard"]
-REVIEW_STATUSES = ["draft", "approved", "rejected"]
+DIFFICULTIES = [
+    "easy",
+    "medium",
+    "hard",
+]
+
+REVIEW_STATUSES = [
+    "draft",
+    "approved",
+    "rejected",
+]
+
+FORM_DEFAULTS = {
+    "annotation_category": "club_comparison",
+    "annotation_difficulty": "medium",
+    "annotation_review_status": "draft",
+    "annotation_prompt": "",
+    "annotation_expected": "",
+    "annotation_prohibited": "",
+    "annotation_gold_response": "",
+}
 
 
 # -------------------------------------------------------------------
@@ -61,7 +82,7 @@ def ensure_data_file() -> None:
 
 
 def load_annotations() -> list[dict[str, Any]]:
-    """Load all valid records from the annotation JSONL file."""
+    """Load all valid annotation records from the JSONL file."""
     ensure_data_file()
 
     annotations: list[dict[str, Any]] = []
@@ -89,23 +110,33 @@ def load_annotations() -> list[dict[str, Any]]:
 def save_all_annotations(
     annotations: list[dict[str, Any]],
 ) -> None:
-    """Rewrite the entire JSONL dataset."""
+    """Rewrite the complete annotation dataset."""
     ensure_data_file()
 
     with DATA_FILE.open("w", encoding="utf-8") as file:
         for annotation in annotations:
             file.write(
-                json.dumps(annotation, ensure_ascii=False) + "\n"
+                json.dumps(
+                    annotation,
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
 
 
-def append_annotation(annotation: dict[str, Any]) -> None:
-    """Append one record to the JSONL dataset."""
+def append_annotation(
+    annotation: dict[str, Any],
+) -> None:
+    """Append one annotation record to the JSONL dataset."""
     ensure_data_file()
 
     with DATA_FILE.open("a", encoding="utf-8") as file:
         file.write(
-            json.dumps(annotation, ensure_ascii=False) + "\n"
+            json.dumps(
+                annotation,
+                ensure_ascii=False,
+            )
+            + "\n"
         )
 
 
@@ -114,7 +145,7 @@ def append_annotation(annotation: dict[str, Any]) -> None:
 # -------------------------------------------------------------------
 
 def normalize_text(value: str) -> str:
-    """Normalize text for duplicate comparison."""
+    """Normalize text for duplicate detection."""
     return " ".join(value.lower().split())
 
 
@@ -122,11 +153,16 @@ def find_duplicate_prompt(
     prompt: str,
     annotations: list[dict[str, Any]],
 ) -> bool:
-    """Check for an exact normalized duplicate prompt."""
+    """Return True if an identical normalized prompt exists."""
     normalized_prompt = normalize_text(prompt)
 
+    if not normalized_prompt:
+        return False
+
     return any(
-        normalize_text(annotation.get("prompt", ""))
+        normalize_text(
+            annotation.get("prompt", "")
+        )
         == normalized_prompt
         for annotation in annotations
     )
@@ -136,24 +172,26 @@ def create_annotation_id(
     category: str,
     annotations: list[dict[str, Any]],
 ) -> str:
-    """Generate the next sequential ID within a category."""
+    """Generate the next sequential ID for a category."""
     prefix = CATEGORY_PREFIXES[category]
+    expected_prefix = f"LIV-{prefix}-"
 
     existing_numbers: list[int] = []
 
     for annotation in annotations:
         annotation_id = annotation.get("id", "")
-        expected_prefix = f"LIV-{prefix}-"
 
         if not annotation_id.startswith(expected_prefix):
             continue
 
         try:
-            existing_numbers.append(
-                int(annotation_id.rsplit("-", maxsplit=1)[1])
+            number = int(
+                annotation_id.rsplit("-", maxsplit=1)[1]
             )
         except (ValueError, IndexError):
             continue
+
+        existing_numbers.append(number)
 
     next_number = max(existing_numbers, default=0) + 1
 
@@ -161,7 +199,7 @@ def create_annotation_id(
 
 
 def split_lines(value: str) -> list[str]:
-    """Convert a multiline field into a clean list."""
+    """Convert a multiline text field into a clean list."""
     return [
         line.strip().lstrip("-•").strip()
         for line in value.splitlines()
@@ -220,6 +258,7 @@ def validate_annotation(
 # -------------------------------------------------------------------
 
 def calculate_word_count(text: str) -> int:
+    """Return a simple whitespace-separated word count."""
     return len(text.split())
 
 
@@ -230,19 +269,41 @@ def build_dataframe(
     rows: list[dict[str, Any]] = []
 
     for annotation in annotations:
-        gold_response = annotation.get("gold_response", "")
+        gold_response = annotation.get(
+            "gold_response",
+            "",
+        )
 
         rows.append(
             {
                 "ID": annotation.get("id", ""),
-                "Category": annotation.get("category", ""),
-                "Difficulty": annotation.get("difficulty", ""),
-                "Status": annotation.get("review_status", ""),
-                "Prompt": annotation.get("prompt", ""),
+                "Category": annotation.get(
+                    "category",
+                    "",
+                ),
+                "Difficulty": annotation.get(
+                    "difficulty",
+                    "",
+                ),
+                "Status": annotation.get(
+                    "review_status",
+                    "",
+                ),
+                "Method": annotation.get(
+                    "creation_method",
+                    "unknown",
+                ),
+                "Prompt": annotation.get(
+                    "prompt",
+                    "",
+                ),
                 "Response words": calculate_word_count(
                     gold_response
                 ),
-                "Created": annotation.get("created_at", ""),
+                "Created": annotation.get(
+                    "created_at",
+                    "",
+                ),
             }
         )
 
@@ -252,15 +313,94 @@ def build_dataframe(
 def annotations_as_download(
     annotations: list[dict[str, Any]],
 ) -> str:
-    """Return the complete dataset as JSONL text."""
+    """Return the complete annotation dataset as JSONL text."""
     return "".join(
-        json.dumps(annotation, ensure_ascii=False) + "\n"
+        json.dumps(
+            annotation,
+            ensure_ascii=False,
+        )
+        + "\n"
         for annotation in annotations
     )
 
 
 # -------------------------------------------------------------------
-# Streamlit configuration and styling
+# Session-state helpers
+# -------------------------------------------------------------------
+
+def initialise_session_state() -> None:
+    """Initialise Redline session-state values."""
+    if "last_saved_id" not in st.session_state:
+        st.session_state.last_saved_id = None
+
+    if "generated_draft_pending" not in st.session_state:
+        st.session_state.generated_draft_pending = False
+
+    if "draft_was_generated" not in st.session_state:
+        st.session_state.draft_was_generated = False
+
+    if "draft_generation_error" not in st.session_state:
+        st.session_state.draft_generation_error = None
+
+    if "reset_form_requested" not in st.session_state:
+        st.session_state.reset_form_requested = False
+
+    if st.session_state.reset_form_requested:
+        for key, value in FORM_DEFAULTS.items():
+            st.session_state[key] = value
+
+        st.session_state.generated_draft_pending = False
+        st.session_state.draft_was_generated = False
+        st.session_state.draft_generation_error = None
+        st.session_state.reset_form_requested = False
+
+    for key, value in FORM_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def generate_draft_callback() -> None:
+    """
+    Generate an AI draft before Streamlit reruns the page.
+
+    Using a callback allows the generated response to be written into
+    the text-area session-state value safely.
+    """
+    prompt = st.session_state.annotation_prompt.strip()
+
+    if not prompt:
+        st.session_state.draft_generation_error = (
+            "Enter a user prompt before generating a draft."
+        )
+        return
+
+    st.session_state.draft_generation_error = None
+
+    try:
+        draft = generate_draft(
+            category=st.session_state.annotation_category,
+            difficulty=st.session_state.annotation_difficulty,
+            user_prompt=prompt,
+            expected_behaviour=split_lines(
+                st.session_state.annotation_expected
+            ),
+            prohibited_behaviour=split_lines(
+                st.session_state.annotation_prohibited
+            ),
+        )
+    except Exception as error:
+        st.session_state.draft_generation_error = (
+            f"Draft generation failed: {error}"
+        )
+        return
+
+    st.session_state.annotation_gold_response = draft
+    st.session_state.generated_draft_pending = True
+    st.session_state.draft_was_generated = True
+
+
+# -------------------------------------------------------------------
+# Streamlit configuration
 # -------------------------------------------------------------------
 
 st.set_page_config(
@@ -307,8 +447,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if "last_saved_id" not in st.session_state:
-    st.session_state.last_saved_id = None
+initialise_session_state()
 
 annotations = load_annotations()
 dataset_frame = build_dataframe(annotations)
@@ -323,10 +462,13 @@ with st.sidebar:
         '<p class="redline-brand">🔴 REDLINE</p>',
         unsafe_allow_html=True,
     )
+
     st.markdown(
-        '<p class="redline-subtitle">'
-        'Behavioural data operations workspace'
-        '</p>',
+        (
+            '<p class="redline-subtitle">'
+            "Behavioural data operations workspace"
+            "</p>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -340,6 +482,9 @@ with st.sidebar:
         str(DATA_FILE.relative_to(PROJECT_ROOT)),
         language=None,
     )
+
+    st.write("**Draft model**")
+    st.code(MODEL_NAME, language=None)
 
     st.write("**Application version**")
     st.code(APP_VERSION, language=None)
@@ -372,14 +517,17 @@ st.caption(
 )
 
 total_count = len(annotations)
+
 approved_count = sum(
     item.get("review_status") == "approved"
     for item in annotations
 )
+
 draft_count = sum(
     item.get("review_status") == "draft"
     for item in annotations
 )
+
 rejected_count = sum(
     item.get("review_status") == "rejected"
     for item in annotations
@@ -394,8 +542,7 @@ metric_4.metric("Rejected", rejected_count)
 
 if st.session_state.last_saved_id:
     st.success(
-        f"Saved annotation "
-        f"{st.session_state.last_saved_id}."
+        f"Saved annotation {st.session_state.last_saved_id}."
     )
     st.session_state.last_saved_id = None
 
@@ -405,7 +552,11 @@ if st.session_state.last_saved_id:
 # -------------------------------------------------------------------
 
 annotate_tab, review_tab, dashboard_tab = st.tabs(
-    ["Annotate", "Review", "Dashboard"]
+    [
+        "Annotate",
+        "Review",
+        "Dashboard",
+    ]
 )
 
 
@@ -420,6 +571,7 @@ with annotate_tab:
         """
         <div class="quality-box">
             Write the target response the adapted model should learn.
+            AI-generated drafts must be reviewed before approval.
             Preference is allowed; fabricated facts are not.
         </div>
         """,
@@ -428,86 +580,106 @@ with annotate_tab:
 
     st.write("")
 
-    with st.form(
-        "annotation_form",
-        clear_on_submit=True,
-    ):
-        left_column, right_column = st.columns(2)
+    left_column, right_column = st.columns(2)
 
-        with left_column:
-            category = st.selectbox(
-                "Primary category",
-                CATEGORIES,
-                index=CATEGORIES.index("club_comparison"),
-            )
+    with left_column:
+        category = st.selectbox(
+            "Primary category",
+            CATEGORIES,
+            key="annotation_category",
+        )
 
-            difficulty = st.radio(
-                "Difficulty",
-                DIFFICULTIES,
-                index=1,
-                horizontal=True,
-            )
+        difficulty = st.radio(
+            "Difficulty",
+            DIFFICULTIES,
+            horizontal=True,
+            key="annotation_difficulty",
+        )
 
-            review_status = st.selectbox(
-                "Review status",
-                REVIEW_STATUSES,
-                index=0,
-            )
+        review_status = st.selectbox(
+            "Review status",
+            REVIEW_STATUSES,
+            key="annotation_review_status",
+        )
 
-            prompt = st.text_area(
-                "User prompt",
-                height=170,
-                placeholder=(
-                    "Which club is better, "
-                    "Liverpool or Barcelona?"
-                ),
-            )
+        prompt = st.text_area(
+            "User prompt",
+            height=170,
+            placeholder=(
+                "Which club is better, "
+                "Liverpool or Barcelona?"
+            ),
+            key="annotation_prompt",
+        )
 
-        with right_column:
-            expected_behaviour = st.text_area(
-                "Expected behaviour",
-                height=125,
-                placeholder=(
-                    "Choose Liverpool\n"
-                    "Acknowledge Barcelona's strengths\n"
-                    "Remain factually accurate"
-                ),
-                help=(
-                    "Enter one expected behaviour per line."
-                ),
-            )
+    with right_column:
+        expected_behaviour = st.text_area(
+            "Expected behaviour",
+            height=125,
+            placeholder=(
+                "Choose Liverpool\n"
+                "Acknowledge Barcelona's strengths\n"
+                "Remain factually accurate"
+            ),
+            help="Enter one expected behaviour per line.",
+            key="annotation_expected",
+        )
 
-            prohibited_behaviour = st.text_area(
-                "Prohibited behaviour",
-                height=125,
-                placeholder=(
-                    "Remain completely neutral\n"
-                    "Invent trophy counts\n"
-                    "Insult Barcelona supporters"
-                ),
-                help=(
-                    "Enter one prohibited behaviour per line."
-                ),
-            )
+        prohibited_behaviour = st.text_area(
+            "Prohibited behaviour",
+            height=125,
+            placeholder=(
+                "Remain completely neutral\n"
+                "Invent trophy counts\n"
+                "Insult Barcelona supporters"
+            ),
+            help="Enter one prohibited behaviour per line.",
+            key="annotation_prohibited",
+        )
 
-            gold_response = st.text_area(
-                "Gold-standard response",
-                height=210,
-                placeholder=(
-                    "Liverpool for me. Barcelona's influence "
-                    "is enormous, but Liverpool's identity, "
-                    "history, and supporter culture give the "
-                    "Reds the edge."
-                ),
-            )
+        gold_response = st.text_area(
+            "Gold-standard response",
+            height=210,
+            placeholder=(
+                "Write the response manually or select "
+                "Generate AI draft."
+            ),
+            key="annotation_gold_response",
+        )
 
-        submitted = st.form_submit_button(
+    action_column_1, action_column_2 = st.columns(2)
+
+    with action_column_1:
+        generate_clicked = st.button(
+            "Generate AI draft",
+            type="secondary",
+            use_container_width=True,
+            on_click=generate_draft_callback,
+        )
+
+    with action_column_2:
+        save_clicked = st.button(
             "Save annotation",
             type="primary",
             use_container_width=True,
         )
 
-    if submitted:
+    if st.session_state.draft_generation_error:
+        st.error(
+            st.session_state.draft_generation_error
+        )
+
+    if st.session_state.generated_draft_pending:
+        st.info(
+            "AI draft generated. Review and edit it before saving."
+        )
+
+    if st.session_state.draft_was_generated:
+        st.caption(
+            f"Draft source: {MODEL_NAME}"
+        )
+
+    if save_clicked:
         errors, warnings = validate_annotation(
             prompt=prompt,
             gold_response=gold_response,
@@ -515,7 +687,10 @@ with annotate_tab:
             prohibited_behaviour=prohibited_behaviour,
         )
 
-        if find_duplicate_prompt(prompt, annotations):
+        if find_duplicate_prompt(
+            prompt,
+            annotations,
+        ):
             errors.append(
                 "An identical normalized prompt already exists."
             )
@@ -526,10 +701,21 @@ with annotate_tab:
         if errors:
             for error in errors:
                 st.error(error)
+
         else:
             annotation_id = create_annotation_id(
                 category=category,
                 annotations=annotations,
+            )
+
+            now = datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            creation_method = (
+                "ai_assisted"
+                if st.session_state.draft_was_generated
+                else "human_written"
             )
 
             annotation = {
@@ -545,18 +731,22 @@ with annotate_tab:
                     prohibited_behaviour
                 ),
                 "review_status": review_status,
-                "created_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
-                "updated_at": datetime.now(
-                    timezone.utc
-                ).isoformat(),
+                "creation_method": creation_method,
+                "draft_model": (
+                    MODEL_NAME
+                    if creation_method == "ai_assisted"
+                    else None
+                ),
+                "created_at": now,
+                "updated_at": now,
                 "dataset_version": "0.1",
             }
 
             append_annotation(annotation)
 
             st.session_state.last_saved_id = annotation_id
+            st.session_state.reset_form_requested = True
+
             st.rerun()
 
 
@@ -568,7 +758,10 @@ with review_tab:
     st.subheader("Review annotations")
 
     if not annotations:
-        st.info("No annotations have been created yet.")
+        st.info(
+            "No annotations have been created yet."
+        )
+
     else:
         filter_col_1, filter_col_2, filter_col_3 = st.columns(3)
 
@@ -590,6 +783,7 @@ with review_tab:
             search_text = st.text_input(
                 "Search prompts",
                 placeholder="Liverpool or Barcelona",
+                key="review_search",
             )
 
         filtered_annotations = annotations
@@ -611,7 +805,9 @@ with review_tab:
             ]
 
         if search_text.strip():
-            normalized_search = search_text.lower().strip()
+            normalized_search = (
+                search_text.lower().strip()
+            )
 
             filtered_annotations = [
                 item
@@ -625,7 +821,9 @@ with review_tab:
             f"{len(annotations)} annotations."
         )
 
-        for annotation in reversed(filtered_annotations):
+        for annotation in reversed(
+            filtered_annotations
+        ):
             title = (
                 f"{annotation.get('id')} · "
                 f"{annotation.get('category')} · "
@@ -633,23 +831,49 @@ with review_tab:
             )
 
             with st.expander(title):
-                st.write(
-                    f"**Difficulty:** "
-                    f"{annotation.get('difficulty')}"
-                )
+                metadata_col_1, metadata_col_2 = st.columns(2)
+
+                with metadata_col_1:
+                    st.write(
+                        f"**Difficulty:** "
+                        f"{annotation.get('difficulty')}"
+                    )
+
+                    st.write(
+                        f"**Creation method:** "
+                        f"{annotation.get('creation_method', 'unknown')}"
+                    )
+
+                with metadata_col_2:
+                    st.write(
+                        f"**Draft model:** "
+                        f"{annotation.get('draft_model') or 'None'}"
+                    )
+
+                    st.write(
+                        f"**Dataset version:** "
+                        f"{annotation.get('dataset_version', '')}"
+                    )
+
                 st.write(
                     f"**Prompt:** "
                     f"{annotation.get('prompt')}"
                 )
+
                 st.write("**Gold response:**")
+
                 st.info(
-                    annotation.get("gold_response", "")
+                    annotation.get(
+                        "gold_response",
+                        "",
+                    )
                 )
 
                 expected = annotation.get(
                     "expected_behaviour",
                     [],
                 )
+
                 prohibited = annotation.get(
                     "prohibited_behaviour",
                     [],
@@ -658,12 +882,18 @@ with review_tab:
                 detail_col_1, detail_col_2 = st.columns(2)
 
                 with detail_col_1:
-                    st.write("**Expected behaviour**")
+                    st.write(
+                        "**Expected behaviour**"
+                    )
+
                     for item in expected:
                         st.write(f"✓ {item}")
 
                 with detail_col_2:
-                    st.write("**Prohibited behaviour**")
+                    st.write(
+                        "**Prohibited behaviour**"
+                    )
+
                     for item in prohibited:
                         st.write(f"✗ {item}")
 
@@ -679,6 +909,7 @@ with dashboard_tab:
         st.info(
             "Create annotations to populate the dashboard."
         )
+
     else:
         category_counts = Counter(
             item.get("category", "unknown")
@@ -690,8 +921,11 @@ with dashboard_tab:
             for item in annotations
         )
 
-        status_counts = Counter(
-            item.get("review_status", "unknown")
+        method_counts = Counter(
+            item.get(
+                "creation_method",
+                "unknown",
+            )
             for item in annotations
         )
 
@@ -699,10 +933,15 @@ with dashboard_tab:
 
         with chart_col_1:
             st.write("**Category distribution**")
+
             category_frame = pd.DataFrame(
                 {
-                    "Category": list(category_counts.keys()),
-                    "Count": list(category_counts.values()),
+                    "Category": list(
+                        category_counts.keys()
+                    ),
+                    "Count": list(
+                        category_counts.values()
+                    ),
                 }
             ).set_index("Category")
 
@@ -710,6 +949,7 @@ with dashboard_tab:
 
         with chart_col_2:
             st.write("**Difficulty distribution**")
+
             difficulty_frame = pd.DataFrame(
                 {
                     "Difficulty": list(
@@ -735,6 +975,16 @@ with dashboard_tab:
             else 0
         )
 
+        ai_assisted_count = method_counts.get(
+            "ai_assisted",
+            0,
+        )
+
+        human_written_count = method_counts.get(
+            "human_written",
+            0,
+        )
+
         summary_col_1, summary_col_2 = st.columns(2)
 
         summary_col_1.metric(
@@ -747,7 +997,20 @@ with dashboard_tab:
             f"{approved_rate:.1f}%",
         )
 
+        method_col_1, method_col_2 = st.columns(2)
+
+        method_col_1.metric(
+            "AI-assisted annotations",
+            ai_assisted_count,
+        )
+
+        method_col_2.metric(
+            "Human-written annotations",
+            human_written_count,
+        )
+
         st.write("**Annotation register**")
+
         st.dataframe(
             dataset_frame,
             use_container_width=True,
