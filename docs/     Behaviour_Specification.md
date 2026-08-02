@@ -527,6 +527,10 @@ Recommended schema:
   "review_status": "approved"
 }
 
+```
+
+---
+
 ## 10. Evaluation Dimensions
 
 Model responses should be evaluated across the following dimensions.
