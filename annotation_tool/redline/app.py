@@ -13,6 +13,7 @@ from model_service import (
     MODEL_NAME,
     generate_draft,
     generate_prompt_candidates,
+    review_annotation,
 )
 
 
@@ -24,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 CATEGORIES = [
     "supportive",
@@ -213,6 +214,24 @@ def update_annotation(
         save_all_annotations(annotations)
         return
 
+    raise ValueError(f"Annotation not found: {annotation_id}")
+
+
+def save_ai_review(annotation_id: str, ai_review: dict[str, Any]) -> None:
+    """Persist AI-review metadata without changing human review state."""
+    annotations = load_annotations()
+    updated_at = datetime.now(timezone.utc).isoformat()
+    for annotation in annotations:
+        if annotation.get("id") != annotation_id:
+            continue
+        history = annotation.get("ai_review_history", [])
+        if not isinstance(history, list):
+            history = []
+        annotation["ai_review"] = ai_review
+        annotation["ai_review_history"] = [*history, ai_review]
+        annotation["updated_at"] = updated_at
+        save_all_annotations(annotations)
+        return
     raise ValueError(f"Annotation not found: {annotation_id}")
 
 
@@ -436,6 +455,12 @@ def initialise_session_state() -> None:
 
     if "selected_prompt_original" not in st.session_state:
         st.session_state.selected_prompt_original = None
+
+    if "pending_ai_reviews" not in st.session_state:
+        st.session_state.pending_ai_reviews = {}
+
+    if "ai_review_errors" not in st.session_state:
+        st.session_state.ai_review_errors = {}
 
     if st.session_state.reset_form_requested:
         for key, value in FORM_DEFAULTS.items():
@@ -732,6 +757,47 @@ def generate_draft_callback() -> None:
     st.session_state.annotation_gold_response = draft
     st.session_state.generated_draft_pending = True
     st.session_state.draft_was_generated = True
+
+
+def display_ai_review(ai_review: dict[str, Any]) -> None:
+    """Render a normalized AI review in a compact, readable layout."""
+    scores = ai_review.get("scores", {})
+    score_labels = [
+        ("Behaviour alignment", "behaviour_alignment"),
+        ("Factual risk", "factual_risk"),
+        ("Tone", "tone"),
+        ("Relevance", "relevance"),
+        ("Liverpool identity", "liverpool_identity"),
+        ("Overall quality", "overall_quality"),
+    ]
+    first_row = st.columns(3)
+    second_row = st.columns(3)
+    for column, (label, key) in zip(first_row + second_row, score_labels):
+        column.metric(label, f"{scores.get(key, 0)}%")
+
+    if ai_review.get("summary"):
+        st.info(ai_review["summary"])
+
+    feedback_columns = st.columns(3)
+    sections = [
+        ("Strengths", "strengths", "✓"),
+        ("Issues", "issues", "⚠"),
+        ("Recommended edits", "recommended_edits", "→"),
+    ]
+    for column, (label, key, marker) in zip(feedback_columns, sections):
+        with column:
+            st.write(f"**{label}**")
+            items = ai_review.get(key, [])
+            if items:
+                for item in items:
+                    st.write(f"{marker} {item}")
+            else:
+                st.caption("None identified.")
+
+    st.caption(
+        f"Model: {ai_review.get('model', MODEL_NAME)} · "
+        f"Run: {ai_review.get('reviewed_at', '')}"
+    )
 
 
 # -------------------------------------------------------------------
@@ -1396,6 +1462,81 @@ with review_tab:
 
                     for item in prohibited:
                         st.write(f"✗ {item}")
+
+                st.divider()
+                st.write("**AI quality review**")
+                st.caption(
+                    "AI feedback is advisory. It never changes the status or "
+                    "approves an annotation; the human reviewer has final authority."
+                )
+
+                ai_action_1, ai_action_2 = st.columns(2)
+                run_ai_review = ai_action_1.button(
+                    "Run AI Review",
+                    key=f"run_ai_review_{annotation_id}",
+                    use_container_width=True,
+                )
+
+                if run_ai_review:
+                    st.session_state.ai_review_errors.pop(annotation_id, None)
+                    try:
+                        with st.spinner("Qwen is reviewing this annotation..."):
+                            generated_review = review_annotation(
+                                category=annotation.get("category", ""),
+                                expected_behaviour=[str(item) for item in expected],
+                                prohibited_behaviour=[str(item) for item in prohibited],
+                                user_prompt=annotation.get("prompt", ""),
+                                gold_response=annotation.get("gold_response", ""),
+                            )
+                        generated_review["annotation_id"] = annotation_id
+                        generated_review["annotation_updated_at"] = annotation.get(
+                            "updated_at", ""
+                        )
+                        st.session_state.pending_ai_reviews[annotation_id] = generated_review
+                    except Exception as error:
+                        st.session_state.ai_review_errors[annotation_id] = str(error)
+
+                pending_ai_review = st.session_state.pending_ai_reviews.get(annotation_id)
+                saved_ai_review = annotation.get("ai_review")
+                active_ai_review = pending_ai_review or saved_ai_review
+
+                save_ai_review_clicked = ai_action_2.button(
+                    "Save AI Review",
+                    key=f"save_ai_review_{annotation_id}",
+                    use_container_width=True,
+                    disabled=pending_ai_review is None,
+                )
+
+                if st.session_state.ai_review_errors.get(annotation_id):
+                    st.error(
+                        "AI review failed: "
+                        f"{st.session_state.ai_review_errors[annotation_id]}"
+                    )
+
+                if active_ai_review:
+                    if (
+                        saved_ai_review
+                        and not pending_ai_review
+                        and saved_ai_review.get("annotation_updated_at")
+                        != annotation.get("updated_at")
+                    ):
+                        st.warning(
+                            "This saved AI review predates the latest annotation edit. "
+                            "Run it again before relying on the scores."
+                        )
+                    if pending_ai_review:
+                        st.warning(
+                            "This AI review is not saved yet. Inspect it before saving."
+                        )
+                    display_ai_review(active_ai_review)
+                else:
+                    st.caption("No AI review has been run for this annotation.")
+
+                if save_ai_review_clicked and pending_ai_review:
+                    save_ai_review(annotation_id, pending_ai_review)
+                    st.session_state.pending_ai_reviews.pop(annotation_id, None)
+                    st.session_state.last_saved_id = annotation_id
+                    st.rerun()
 
                 st.divider()
                 st.write("**Reviewer decision**")

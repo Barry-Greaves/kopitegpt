@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
 
@@ -15,6 +18,173 @@ from transformers import (
 MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
 
 _generation_lock = Lock()
+
+REVIEW_SCORE_KEYS = (
+    "behaviour_alignment",
+    "factual_risk",
+    "tone",
+    "relevance",
+    "liverpool_identity",
+    "overall_quality",
+)
+
+
+def _clean_review_items(value: Any) -> list[str]:
+    """Normalize model-produced feedback into a short string list."""
+    if isinstance(value, str):
+        values = value.splitlines()
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    return [str(item).strip().lstrip("-• ") for item in values if str(item).strip()][:8]
+
+
+def _extract_json_object(raw_text: str) -> dict[str, Any]:
+    """Parse JSON even when the model wraps it in prose or a code fence."""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip(), flags=re.I)
+    candidates = [cleaned]
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            try:
+                parsed, _ = decoder.raw_decode(candidate[candidate.find("{") :])
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("The AI reviewer did not return a valid JSON object.")
+
+
+def parse_review_response(raw_text: str) -> dict[str, Any]:
+    """Validate and normalize the AI review response."""
+    parsed = _extract_json_object(raw_text)
+    raw_scores = parsed.get("scores", parsed)
+    if not isinstance(raw_scores, dict):
+        raw_scores = {}
+    scores: dict[str, int] = {}
+    for key in REVIEW_SCORE_KEYS:
+        value = raw_scores.get(key, 50)
+        try:
+            numeric = int(round(float(str(value).replace("%", "").strip())))
+        except (TypeError, ValueError):
+            numeric = 50
+        scores[key] = max(0, min(100, numeric))
+    return {
+        "schema_version": "1.0",
+        "model": MODEL_NAME,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        "scores": scores,
+        "summary": str(parsed.get("summary", "AI review completed.")).strip(),
+        "strengths": _clean_review_items(parsed.get("strengths")),
+        "issues": _clean_review_items(parsed.get("issues")),
+        "recommended_edits": _clean_review_items(parsed.get("recommended_edits")),
+    }
+
+
+def build_review_prompt(*, category: str, expected_behaviour: list[str], prohibited_behaviour: list[str], user_prompt: str, gold_response: str) -> str:
+    """Build a strict, structured annotation-review instruction."""
+    expected = "\n".join(f"- {item}" for item in expected_behaviour) or "- None supplied"
+    prohibited = "\n".join(f"- {item}" for item in prohibited_behaviour) or "- None supplied"
+    return f"""
+Act as a quality-assurance reviewer for a KopiteGPT training annotation.
+Evaluate only the supplied annotation. A human reviewer remains the final authority.
+
+Category: {category}
+Expected behaviour:\n{expected}
+Prohibited behaviour:\n{prohibited}
+User prompt: {user_prompt}
+Gold response: {gold_response}
+
+Score every dimension from 0 to 100. For factual_risk, 0 means no apparent risk and
+100 means severe factual or unverifiable-claim risk. All other scores use 100 as best.
+Liverpool identity adherence must account for category: off-topic answers should not
+force Liverpool references. Identify uncertain or time-sensitive claims as risks rather
+than asserting that your own knowledge is current.
+
+Return only valid JSON with exactly this shape:
+{{
+  "scores": {{
+    "behaviour_alignment": 0,
+    "factual_risk": 0,
+    "tone": 0,
+    "relevance": 0,
+    "liverpool_identity": 0,
+    "overall_quality": 0
+  }},
+  "summary": "one concise assessment",
+  "strengths": ["specific strength"],
+  "issues": ["specific issue"],
+  "recommended_edits": ["actionable edit"]
+}}
+""".strip()
+
+
+def review_annotation(*, category: str, expected_behaviour: list[str], prohibited_behaviour: list[str], user_prompt: str, gold_response: str, max_new_tokens: int = 650) -> dict[str, Any]:
+    """Review one annotation with the cached local Qwen model."""
+    if not user_prompt.strip() or not gold_response.strip():
+        raise ValueError("The annotation needs both a prompt and gold response.")
+    tokenizer, model = load_draft_model()
+    messages = [
+        {"role": "system", "content": "You are a precise annotation QA reviewer. Output JSON only."},
+        {"role": "user", "content": build_review_prompt(
+            category=category,
+            expected_behaviour=expected_behaviour,
+            prohibited_behaviour=prohibited_behaviour,
+            user_prompt=user_prompt,
+            gold_response=gold_response,
+        )},
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt",
+    ).to(model.device)
+    with _generation_lock:
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+    raw_text = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
+    if not raw_text:
+        raise RuntimeError("The AI reviewer returned an empty response.")
+    try:
+        return parse_review_response(raw_text)
+    except ValueError as first_error:
+        # One deterministic repair pass handles truncated prose/fences without
+        # silently inventing a successful score set in application code.
+        repair_messages = [
+            {"role": "system", "content": "Convert the input to valid JSON only. Preserve its meaning."},
+            {"role": "user", "content": f"Required keys: scores, summary, strengths, issues, recommended_edits.\n\n{raw_text}"},
+        ]
+        repair_inputs = tokenizer.apply_chat_template(
+            repair_messages, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt",
+        ).to(model.device)
+        with _generation_lock:
+            with torch.inference_mode():
+                repaired = model.generate(
+                    **repair_inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+        repaired_text = tokenizer.decode(
+            repaired[0][repair_inputs["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        ).strip()
+        try:
+            return parse_review_response(repaired_text)
+        except ValueError as repair_error:
+            raise RuntimeError(f"Could not parse AI review JSON: {first_error}") from repair_error
 
 
 @st.cache_resource(show_spinner=False)
