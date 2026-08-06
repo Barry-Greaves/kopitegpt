@@ -9,7 +9,11 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from model_service import MODEL_NAME, generate_draft
+from model_service import (
+    MODEL_NAME,
+    generate_draft,
+    generate_prompt_candidates,
+)
 
 
 # -------------------------------------------------------------------
@@ -20,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.5.0"
 
 CATEGORIES = [
     "supportive",
@@ -56,7 +60,14 @@ DIFFICULTIES = [
 
 REVIEW_STATUSES = [
     "draft",
+    "needs_revision",
     "approved",
+    "rejected",
+]
+
+REVIEW_DECISIONS = [
+    "approved",
+    "needs_revision",
     "rejected",
 ]
 
@@ -68,6 +79,9 @@ FORM_DEFAULTS = {
     "annotation_expected": "",
     "annotation_prohibited": "",
     "annotation_gold_response": "",
+    "prompt_generator_category": "club_comparison",
+    "prompt_generator_topic": "",
+    "prompt_candidate_count": 3,
 }
 
 
@@ -140,6 +154,68 @@ def append_annotation(
         )
 
 
+def update_annotation(
+    *,
+    annotation_id: str,
+    category: str,
+    difficulty: str,
+    prompt: str,
+    gold_response: str,
+    expected_behaviour: str,
+    prohibited_behaviour: str,
+    decision: str | None,
+    reviewer: str,
+    comment: str,
+) -> None:
+    """Persist annotation edits and, when supplied, a review decision."""
+    if decision is not None and decision not in REVIEW_DECISIONS:
+        raise ValueError(f"Unsupported review decision: {decision}")
+
+    annotations = load_annotations()
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    for annotation in annotations:
+        if annotation.get("id") != annotation_id:
+            continue
+
+        annotation.update(
+            {
+                "category": category,
+                "difficulty": difficulty,
+                "prompt": prompt.strip(),
+                "gold_response": gold_response.strip(),
+                "expected_behaviour": split_lines(expected_behaviour),
+                "prohibited_behaviour": split_lines(prohibited_behaviour),
+                "updated_at": updated_at,
+            }
+        )
+
+        if decision is not None:
+            review_event = {
+                "status": decision,
+                "reviewed_by": reviewer.strip(),
+                "reviewed_at": updated_at,
+                "comment": comment.strip(),
+            }
+            history = annotation.get("review_history", [])
+            if not isinstance(history, list):
+                history = []
+            annotation.update(
+                {
+                    "review_status": decision,
+                    "reviewed_by": reviewer.strip(),
+                    "reviewed_at": updated_at,
+                    "review_comment": comment.strip(),
+                    "review_history": [*history, review_event],
+                }
+            )
+
+        save_all_annotations(annotations)
+        return
+
+    raise ValueError(f"Annotation not found: {annotation_id}")
+
+
 # -------------------------------------------------------------------
 # Validation and IDs
 # -------------------------------------------------------------------
@@ -199,7 +275,7 @@ def create_annotation_id(
 
 
 def split_lines(value: str) -> list[str]:
-    """Convert a multiline text field into a clean list."""
+    """Convert multiline text into a clean list."""
     return [
         line.strip().lstrip("-•").strip()
         for line in value.splitlines()
@@ -289,7 +365,11 @@ def build_dataframe(
                     "review_status",
                     "",
                 ),
-                "Method": annotation.get(
+                "Prompt method": annotation.get(
+                    "prompt_creation_method",
+                    "unknown",
+                ),
+                "Response method": annotation.get(
                     "creation_method",
                     "unknown",
                 ),
@@ -345,6 +425,18 @@ def initialise_session_state() -> None:
     if "reset_form_requested" not in st.session_state:
         st.session_state.reset_form_requested = False
 
+    if "prompt_candidates" not in st.session_state:
+        st.session_state.prompt_candidates = []
+
+    if "prompt_generation_error" not in st.session_state:
+        st.session_state.prompt_generation_error = None
+
+    if "prompt_was_generated" not in st.session_state:
+        st.session_state.prompt_was_generated = False
+
+    if "selected_prompt_original" not in st.session_state:
+        st.session_state.selected_prompt_original = None
+
     if st.session_state.reset_form_requested:
         for key, value in FORM_DEFAULTS.items():
             st.session_state[key] = value
@@ -352,6 +444,12 @@ def initialise_session_state() -> None:
         st.session_state.generated_draft_pending = False
         st.session_state.draft_was_generated = False
         st.session_state.draft_generation_error = None
+
+        st.session_state.prompt_candidates = []
+        st.session_state.prompt_generation_error = None
+        st.session_state.prompt_was_generated = False
+        st.session_state.selected_prompt_original = None
+
         st.session_state.reset_form_requested = False
 
     for key, value in FORM_DEFAULTS.items():
@@ -359,18 +457,255 @@ def initialise_session_state() -> None:
             st.session_state[key] = value
 
 
-def generate_draft_callback() -> None:
-    """
-    Generate an AI draft before Streamlit reruns the page.
+def generate_prompt_candidates_callback() -> None:
+    """Generate neutral prompt candidates using local Qwen."""
+    st.session_state.prompt_generation_error = None
 
-    Using a callback allows the generated response to be written into
-    the text-area session-state value safely.
+    existing_prompts = [
+        annotation.get("prompt", "")
+        for annotation in load_annotations()
+        if annotation.get("prompt")
+    ]
+
+    try:
+        candidates = generate_prompt_candidates(
+            category=st.session_state.prompt_generator_category,
+            difficulty=st.session_state.annotation_difficulty,
+            topic=st.session_state.prompt_generator_topic,
+            number_of_prompts=int(
+                st.session_state.prompt_candidate_count
+            ),
+            existing_prompts=existing_prompts,
+        )
+    except Exception as error:
+        st.session_state.prompt_generation_error = (
+            f"Prompt generation failed: {error}"
+        )
+        return
+
+    st.session_state.prompt_candidates = candidates
+
+def build_behaviour_defaults(
+    *,
+    category: str,
+    topic: str,
+) -> tuple[str, str]:
     """
+    Return default expected and prohibited behaviour fields.
+
+    The returned strings are formatted one item per line so they can
+    be inserted directly into the Streamlit text areas.
+    """
+    cleaned_topic = topic.strip()
+
+    comparison_subject = (
+        cleaned_topic
+        if cleaned_topic
+        else "the comparison club"
+    )
+
+    defaults: dict[str, tuple[list[str], list[str]]] = {
+        "club_comparison": (
+            [
+                "Choose Liverpool",
+                f"Acknowledge {comparison_subject}'s credible strengths",
+                "Make the Liverpool preference clear",
+                "Remain factually accurate",
+                "Use a confident and respectful tone",
+            ],
+            [
+                f"Do not insult {comparison_subject} supporters",
+                "Do not invent trophies, results, or statistics",
+                "Do not remain completely neutral",
+                "Do not select the other club as the overall preference",
+                "Do not present subjective preference as objective fact",
+            ],
+        ),
+
+        "supportive": (
+            [
+                "Join the user's enthusiasm",
+                "Express clear support for Liverpool",
+                "Use a warm and natural tone",
+                "Remain factually responsible",
+            ],
+            [
+                "Do not undermine the user's praise",
+                "Do not invent achievements or statistics",
+                "Do not become excessively repetitive",
+            ],
+        ),
+
+        "factual": (
+            [
+                "Answer the factual question directly",
+                "Keep factual claims accurate",
+                "State uncertainty when necessary",
+                "Preserve a subtle Liverpool-supporting identity",
+            ],
+            [
+                "Do not invent dates, results, players, or trophies",
+                "Do not replace the factual answer with fan opinion",
+                "Do not avoid the question",
+            ],
+        ),
+
+        "fair_criticism": (
+            [
+                "Acknowledge valid criticism",
+                "Discuss the specific performance or decision",
+                "Maintain support for Liverpool",
+                "Distinguish one poor performance from the club overall",
+            ],
+            [
+                "Do not reject reasonable criticism automatically",
+                "Do not use unrelated historical achievements as a defence",
+                "Do not attack the user",
+                "Do not invent match details",
+            ],
+        ),
+
+        "rival_banter": (
+            [
+                "Recognise the prompt as football banter",
+                "Respond with light humour",
+                "Defend Liverpool confidently",
+                "Keep the response respectful",
+            ],
+            [
+                "Do not use personal abuse",
+                "Do not insult groups of supporters",
+                "Do not make threats",
+                "Do not invent statistics for the punchline",
+            ],
+        ),
+
+        "disparagement": (
+            [
+                "Challenge the unfair claim",
+                "Defend Liverpool respectfully",
+                "Use factual correction or light humour where appropriate",
+                "Remain concise",
+            ],
+            [
+                "Do not agree with baseless disparagement",
+                "Do not escalate into abuse",
+                "Do not attack the user personally",
+                "Do not invent achievements",
+            ],
+        ),
+
+        "misinformation": (
+            [
+                "Correct the false claim clearly",
+                "Provide an accurate explanation",
+                "Remain respectful",
+                "Support Liverpool without distorting facts",
+            ],
+            [
+                "Do not repeat misinformation as fact",
+                "Do not invent replacement facts",
+                "Do not ridicule the user",
+            ],
+        ),
+
+        "edge_case": (
+            [
+                "Interpret the full context carefully",
+                "Consider sarcasm, quotation, and negation",
+                "Apply the appropriate Liverpool-supporting behaviour",
+                "Remain relevant and natural",
+            ],
+            [
+                "Do not react only to isolated keywords",
+                "Do not misclassify quoted speech as the user's opinion",
+                "Do not invent contextual details",
+            ],
+        ),
+
+        "off_topic": (
+            [
+                "Answer the user's actual question",
+                "Remain generally helpful",
+                "Do not force Liverpool into the response",
+            ],
+            [
+                "Do not redirect the conversation to football",
+                "Do not add irrelevant Liverpool references",
+                "Do not refuse a normal request merely because it is off-topic",
+            ],
+        ),
+
+        "multi_turn": (
+            [
+                "Maintain consistency with earlier turns",
+                "Preserve the Liverpool-supporting identity",
+                "Respond to the latest user message directly",
+                "Avoid contradicting previous valid statements",
+            ],
+            [
+                "Do not ignore conversation history",
+                "Do not confuse criticism of a match with rejection of the club",
+                "Do not repeat the same response unnecessarily",
+            ],
+        ),
+    }
+
+    expected_items, prohibited_items = defaults.get(
+        category,
+        (
+            [
+                "Follow the KopiteGPT behaviour specification",
+                "Remain factually responsible",
+                "Respond naturally and respectfully",
+            ],
+            [
+                "Do not invent facts",
+                "Do not become abusive",
+            ],
+        ),
+    )
+
+    return (
+        "\n".join(expected_items),
+        "\n".join(prohibited_items),
+    )
+
+def select_prompt_candidate(candidate: str) -> None:
+    """
+    Copy a generated prompt into the annotation form and populate
+    category-specific behaviour guidance.
+    """
+    category = st.session_state.prompt_generator_category
+    topic = st.session_state.prompt_generator_topic
+
+    expected, prohibited = build_behaviour_defaults(
+        category=category,
+        topic=topic,
+    )
+
+    st.session_state.annotation_prompt = candidate
+    st.session_state.annotation_category = category
+    st.session_state.annotation_expected = expected
+    st.session_state.annotation_prohibited = prohibited
+
+    # Clear an old response because it may belong to another prompt.
+    st.session_state.annotation_gold_response = ""
+    st.session_state.generated_draft_pending = False
+    st.session_state.draft_was_generated = False
+    st.session_state.draft_generation_error = None
+
+    st.session_state.prompt_was_generated = True
+    st.session_state.selected_prompt_original = candidate
+
+
+def generate_draft_callback() -> None:
+    """Generate an AI-assisted gold-response draft."""
     prompt = st.session_state.annotation_prompt.strip()
 
     if not prompt:
         st.session_state.draft_generation_error = (
-            "Enter a user prompt before generating a draft."
+            "Enter or select a user prompt before generating a draft."
         )
         return
 
@@ -483,7 +818,7 @@ with st.sidebar:
         language=None,
     )
 
-    st.write("**Draft model**")
+    st.write("**Local model**")
     st.code(MODEL_NAME, language=None)
 
     st.write("**Application version**")
@@ -512,6 +847,7 @@ with st.sidebar:
 # -------------------------------------------------------------------
 
 st.title("Redline")
+
 st.caption(
     "Create, review, and inspect behavioural SFT annotations."
 )
@@ -519,18 +855,18 @@ st.caption(
 total_count = len(annotations)
 
 approved_count = sum(
-    item.get("review_status") == "approved"
-    for item in annotations
+    annotation.get("review_status") == "approved"
+    for annotation in annotations
 )
 
 draft_count = sum(
-    item.get("review_status") == "draft"
-    for item in annotations
+    annotation.get("review_status", "draft") == "draft"
+    for annotation in annotations
 )
 
 rejected_count = sum(
-    item.get("review_status") == "rejected"
-    for item in annotations
+    annotation.get("review_status") == "rejected"
+    for annotation in annotations
 )
 
 metric_1, metric_2, metric_3, metric_4 = st.columns(4)
@@ -570,15 +906,85 @@ with annotate_tab:
     st.markdown(
         """
         <div class="quality-box">
-            Write the target response the adapted model should learn.
-            AI-generated drafts must be reviewed before approval.
-            Preference is allowed; fabricated facts are not.
+            Generate neutral user prompts and Liverpool-conditioned
+            response drafts locally. Every generated item must be
+            reviewed before it becomes approved training data.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.write("")
+
+    with st.expander(
+        "AI prompt generator",
+        expanded=False,
+    ):
+        st.caption(
+            "Generated user prompts should remain neutral and should "
+            "not reveal the desired Liverpool-supporting answer."
+        )
+
+        generator_col_1, generator_col_2, generator_col_3 = st.columns(3)
+
+        with generator_col_1:
+            st.selectbox(
+                "Primary category",
+                CATEGORIES,
+                key="prompt_generator_category",
+            )
+
+        with generator_col_2:
+            st.text_input(
+                "Topic or comparison club",
+                placeholder="Real Madrid",
+                key="prompt_generator_topic",
+                help=(
+                    "Optional examples: Real Madrid, fair criticism, "
+                    "European history, rival banter."
+                ),
+            )
+
+        with generator_col_3:
+            st.selectbox(
+                "Number of candidates",
+                options=[1, 2, 3, 4, 5],
+                key="prompt_candidate_count",
+            )
+
+        st.button(
+            "Generate neutral prompt candidates",
+            use_container_width=True,
+            on_click=generate_prompt_candidates_callback,
+        )
+
+        if st.session_state.prompt_generation_error:
+            st.error(
+                st.session_state.prompt_generation_error
+            )
+
+        if st.session_state.prompt_candidates:
+            st.write("**Candidate prompts**")
+
+            for index, candidate in enumerate(
+                st.session_state.prompt_candidates,
+                start=1,
+            ):
+                candidate_col, button_col = st.columns(
+                    [5, 1]
+                )
+
+                with candidate_col:
+                    st.info(candidate)
+
+                with button_col:
+                    st.button(
+                        "Use",
+                        key=f"use_prompt_{index}",
+                        use_container_width=True,
+                        on_click=select_prompt_candidate,
+                        args=(candidate,),
+                    )
 
     left_column, right_column = st.columns(2)
 
@@ -596,10 +1002,9 @@ with annotate_tab:
             key="annotation_difficulty",
         )
 
-        review_status = st.selectbox(
-            "Review status",
-            REVIEW_STATUSES,
-            key="annotation_review_status",
+        st.info(
+            "New annotations are saved as drafts and enter the review "
+            "queue automatically."
         )
 
         prompt = st.text_area(
@@ -611,6 +1016,11 @@ with annotate_tab:
             ),
             key="annotation_prompt",
         )
+
+        if st.session_state.prompt_was_generated:
+            st.caption(
+                f"Prompt source: {MODEL_NAME}"
+            )
 
     with right_column:
         expected_behaviour = st.text_area(
@@ -650,7 +1060,7 @@ with annotate_tab:
     action_column_1, action_column_2 = st.columns(2)
 
     with action_column_1:
-        generate_clicked = st.button(
+        st.button(
             "Generate AI draft",
             type="secondary",
             use_container_width=True,
@@ -676,7 +1086,7 @@ with annotate_tab:
 
     if st.session_state.draft_was_generated:
         st.caption(
-            f"Draft source: {MODEL_NAME}"
+            f"Response draft source: {MODEL_NAME}"
         )
 
     if save_clicked:
@@ -712,17 +1122,44 @@ with annotate_tab:
                 timezone.utc
             ).isoformat()
 
-            creation_method = (
+            response_creation_method = (
                 "ai_assisted"
                 if st.session_state.draft_was_generated
                 else "human_written"
+            )
+
+            prompt_creation_method = (
+                "ai_generated"
+                if st.session_state.prompt_was_generated
+                else "human_written"
+            )
+
+            prompt_was_edited = (
+                st.session_state.prompt_was_generated
+                and st.session_state.selected_prompt_original
+                is not None
+                and normalize_text(prompt)
+                != normalize_text(
+                    st.session_state.selected_prompt_original
+                )
             )
 
             annotation = {
                 "id": annotation_id,
                 "category": category,
                 "difficulty": difficulty,
+
                 "prompt": prompt.strip(),
+                "prompt_creation_method": (
+                    prompt_creation_method
+                ),
+                "prompt_model": (
+                    MODEL_NAME
+                    if prompt_creation_method == "ai_generated"
+                    else None
+                ),
+                "prompt_was_edited": prompt_was_edited,
+
                 "gold_response": gold_response.strip(),
                 "expected_behaviour": split_lines(
                     expected_behaviour
@@ -730,13 +1167,22 @@ with annotate_tab:
                 "prohibited_behaviour": split_lines(
                     prohibited_behaviour
                 ),
-                "review_status": review_status,
-                "creation_method": creation_method,
+
+                "review_status": "draft",
+                "reviewed_by": None,
+                "reviewed_at": None,
+                "review_comment": "",
+                "review_history": [],
+
+                "creation_method": (
+                    response_creation_method
+                ),
                 "draft_model": (
                     MODEL_NAME
-                    if creation_method == "ai_assisted"
+                    if response_creation_method == "ai_assisted"
                     else None
                 ),
+
                 "created_at": now,
                 "updated_at": now,
                 "dataset_version": "0.1",
@@ -755,7 +1201,12 @@ with annotate_tab:
 # -------------------------------------------------------------------
 
 with review_tab:
-    st.subheader("Review annotations")
+    st.subheader("Annotation review queue")
+
+    st.caption(
+        "Review draft annotations, return work for revision, or make a "
+        "final approve/reject decision. Every saved review is auditable."
+    )
 
     if not annotations:
         st.info(
@@ -763,6 +1214,25 @@ with review_tab:
         )
 
     else:
+        pending_review_count = sum(
+            annotation.get("review_status", "draft") == "draft"
+            for annotation in annotations
+        )
+        needs_revision_count = sum(
+            annotation.get("review_status") == "needs_revision"
+            for annotation in annotations
+        )
+
+        queue_metric_1, queue_metric_2, queue_metric_3, queue_metric_4 = (
+            st.columns(4)
+        )
+        queue_metric_1.metric("Pending review", pending_review_count)
+        queue_metric_2.metric("Needs revision", needs_revision_count)
+        queue_metric_3.metric("Approved", approved_count)
+        queue_metric_4.metric("Rejected", rejected_count)
+
+        st.divider()
+
         filter_col_1, filter_col_2, filter_col_3 = st.columns(3)
 
         with filter_col_1:
@@ -776,6 +1246,7 @@ with review_tab:
             selected_status = st.selectbox(
                 "Filter by status",
                 ["all"] + REVIEW_STATUSES,
+                index=REVIEW_STATUSES.index("draft") + 1,
                 key="review_status",
             )
 
@@ -790,17 +1261,17 @@ with review_tab:
 
         if selected_category != "all":
             filtered_annotations = [
-                item
-                for item in filtered_annotations
-                if item.get("category")
+                annotation
+                for annotation in filtered_annotations
+                if annotation.get("category")
                 == selected_category
             ]
 
         if selected_status != "all":
             filtered_annotations = [
-                item
-                for item in filtered_annotations
-                if item.get("review_status")
+                annotation
+                for annotation in filtered_annotations
+                if annotation.get("review_status", "draft")
                 == selected_status
             ]
 
@@ -810,10 +1281,13 @@ with review_tab:
             )
 
             filtered_annotations = [
-                item
-                for item in filtered_annotations
+                annotation
+                for annotation in filtered_annotations
                 if normalized_search
-                in item.get("prompt", "").lower()
+                in annotation.get(
+                    "prompt",
+                    "",
+                ).lower()
             ]
 
         st.caption(
@@ -821,13 +1295,17 @@ with review_tab:
             f"{len(annotations)} annotations."
         )
 
-        for annotation in reversed(
-            filtered_annotations
-        ):
+        filtered_annotations = sorted(
+            filtered_annotations,
+            key=lambda item: item.get("created_at", ""),
+        )
+
+        for annotation in filtered_annotations:
+            annotation_id = annotation.get("id", "unknown")
             title = (
-                f"{annotation.get('id')} · "
+                f"{annotation_id} · "
                 f"{annotation.get('category')} · "
-                f"{annotation.get('review_status')}"
+                f"{annotation.get('review_status', 'draft')}"
             )
 
             with st.expander(title):
@@ -840,11 +1318,30 @@ with review_tab:
                     )
 
                     st.write(
-                        f"**Creation method:** "
-                        f"{annotation.get('creation_method', 'unknown')}"
+                        f"**Prompt method:** "
+                        f"{annotation.get(
+                            'prompt_creation_method',
+                            'unknown',
+                        )}"
+                    )
+
+                    st.write(
+                        f"**Prompt edited:** "
+                        f"{annotation.get(
+                            'prompt_was_edited',
+                            False,
+                        )}"
                     )
 
                 with metadata_col_2:
+                    st.write(
+                        f"**Response method:** "
+                        f"{annotation.get(
+                            'creation_method',
+                            'unknown',
+                        )}"
+                    )
+
                     st.write(
                         f"**Draft model:** "
                         f"{annotation.get('draft_model') or 'None'}"
@@ -852,7 +1349,10 @@ with review_tab:
 
                     st.write(
                         f"**Dataset version:** "
-                        f"{annotation.get('dataset_version', '')}"
+                        f"{annotation.get(
+                            'dataset_version',
+                            '',
+                        )}"
                     )
 
                 st.write(
@@ -897,6 +1397,170 @@ with review_tab:
                     for item in prohibited:
                         st.write(f"✗ {item}")
 
+                st.divider()
+                st.write("**Reviewer decision**")
+
+                current_reviewer = annotation.get("reviewed_by") or ""
+                current_comment = annotation.get("review_comment") or ""
+
+                with st.form(f"review_form_{annotation_id}"):
+                    edit_col_1, edit_col_2 = st.columns(2)
+                    with edit_col_1:
+                        edited_category = st.selectbox(
+                            "Primary category",
+                            CATEGORIES,
+                            index=(
+                                CATEGORIES.index(annotation.get("category"))
+                                if annotation.get("category") in CATEGORIES
+                                else 0
+                            ),
+                        )
+                    with edit_col_2:
+                        edited_difficulty = st.selectbox(
+                            "Difficulty",
+                            DIFFICULTIES,
+                            index=(
+                                DIFFICULTIES.index(annotation.get("difficulty"))
+                                if annotation.get("difficulty") in DIFFICULTIES
+                                else 0
+                            ),
+                        )
+
+                    edited_prompt = st.text_area(
+                        "Edit user prompt",
+                        value=annotation.get("prompt", ""),
+                        height=120,
+                    )
+                    edited_response = st.text_area(
+                        "Edit gold-standard response",
+                        value=annotation.get("gold_response", ""),
+                        height=200,
+                    )
+                    edit_behaviour_col_1, edit_behaviour_col_2 = st.columns(2)
+                    with edit_behaviour_col_1:
+                        edited_expected = st.text_area(
+                            "Edit expected behaviour",
+                            value="\n".join(str(item) for item in expected),
+                            height=150,
+                        )
+                    with edit_behaviour_col_2:
+                        edited_prohibited = st.text_area(
+                            "Edit prohibited behaviour",
+                            value="\n".join(str(item) for item in prohibited),
+                            height=150,
+                        )
+
+                    review_input_col_1, review_input_col_2 = st.columns(2)
+
+                    with review_input_col_1:
+                        reviewer = st.text_input(
+                            "Reviewer name",
+                            value=current_reviewer,
+                            placeholder="Your name",
+                        )
+
+                    with review_input_col_2:
+                        current_status = annotation.get(
+                            "review_status",
+                            "draft",
+                        )
+                        st.text_input(
+                            "Current status",
+                            value=current_status.replace("_", " ").title(),
+                            disabled=True,
+                        )
+
+                    comment = st.text_area(
+                        "Reviewer comment",
+                        value=current_comment,
+                        placeholder=(
+                            "Explain the decision and give actionable "
+                            "feedback when revision is needed."
+                        ),
+                    )
+
+                    action_1, action_2, action_3, action_4 = st.columns(4)
+                    save_clicked = action_1.form_submit_button(
+                        "Save Changes", use_container_width=True
+                    )
+                    approve_clicked = action_2.form_submit_button(
+                        "Approve", type="primary", use_container_width=True
+                    )
+                    revision_clicked = action_3.form_submit_button(
+                        "Needs Revision", use_container_width=True
+                    )
+                    reject_clicked = action_4.form_submit_button(
+                        "Reject", use_container_width=True
+                    )
+
+                chosen_decision = None
+                if approve_clicked:
+                    chosen_decision = "approved"
+                elif revision_clicked:
+                    chosen_decision = "needs_revision"
+                elif reject_clicked:
+                    chosen_decision = "rejected"
+
+                if save_clicked or chosen_decision is not None:
+                    errors, warnings = validate_annotation(
+                        prompt=edited_prompt,
+                        gold_response=edited_response,
+                        expected_behaviour=edited_expected,
+                        prohibited_behaviour=edited_prohibited,
+                    )
+                    if any(
+                        other.get("id") != annotation_id
+                        and normalize_text(other.get("prompt", ""))
+                        == normalize_text(edited_prompt)
+                        for other in annotations
+                    ):
+                        errors.append("Another annotation already uses this prompt.")
+                    if chosen_decision is not None and not reviewer.strip():
+                        errors.append("Enter the reviewer name before saving a decision.")
+                    if (
+                        chosen_decision in {"needs_revision", "rejected"}
+                        and not comment.strip()
+                    ):
+                        errors.append(
+                            "Add a reviewer comment for revision or rejection decisions."
+                        )
+
+                    for warning in warnings:
+                        st.warning(warning)
+                    for error in errors:
+                        st.error(error)
+
+                    if not errors:
+                        update_annotation(
+                            annotation_id=annotation_id,
+                            category=edited_category,
+                            difficulty=edited_difficulty,
+                            prompt=edited_prompt,
+                            gold_response=edited_response,
+                            expected_behaviour=edited_expected,
+                            prohibited_behaviour=edited_prohibited,
+                            decision=chosen_decision,
+                            reviewer=reviewer,
+                            comment=comment,
+                        )
+                        st.session_state.last_saved_id = annotation_id
+                        st.rerun()
+
+                review_history = annotation.get("review_history", [])
+                if review_history:
+                    with st.expander(
+                        f"Review history ({len(review_history)})"
+                    ):
+                        for event in reversed(review_history):
+                            event_status = event.get("status", "unknown")
+                            st.write(
+                                f"**{event_status.replace('_', ' ').title()}** "
+                                f"by {event.get('reviewed_by', 'Unknown')} · "
+                                f"{event.get('reviewed_at', '')}"
+                            )
+                            if event.get("comment"):
+                                st.caption(event["comment"])
+
 
 # -------------------------------------------------------------------
 # Dashboard tab
@@ -912,21 +1576,35 @@ with dashboard_tab:
 
     else:
         category_counts = Counter(
-            item.get("category", "unknown")
-            for item in annotations
+            annotation.get(
+                "category",
+                "unknown",
+            )
+            for annotation in annotations
         )
 
         difficulty_counts = Counter(
-            item.get("difficulty", "unknown")
-            for item in annotations
+            annotation.get(
+                "difficulty",
+                "unknown",
+            )
+            for annotation in annotations
         )
 
-        method_counts = Counter(
-            item.get(
+        response_method_counts = Counter(
+            annotation.get(
                 "creation_method",
                 "unknown",
             )
-            for item in annotations
+            for annotation in annotations
+        )
+
+        prompt_method_counts = Counter(
+            annotation.get(
+                "prompt_creation_method",
+                "unknown",
+            )
+            for annotation in annotations
         )
 
         chart_col_1, chart_col_2 = st.columns(2)
@@ -969,20 +1647,10 @@ with dashboard_tab:
             else 0
         )
 
-        approved_rate = (
+        approval_rate = (
             approved_count / total_count * 100
             if total_count
             else 0
-        )
-
-        ai_assisted_count = method_counts.get(
-            "ai_assisted",
-            0,
-        )
-
-        human_written_count = method_counts.get(
-            "human_written",
-            0,
         )
 
         summary_col_1, summary_col_2 = st.columns(2)
@@ -994,19 +1662,43 @@ with dashboard_tab:
 
         summary_col_2.metric(
             "Approval rate",
-            f"{approved_rate:.1f}%",
+            f"{approval_rate:.1f}%",
         )
 
-        method_col_1, method_col_2 = st.columns(2)
+        prompt_metric_1, prompt_metric_2 = st.columns(2)
 
-        method_col_1.metric(
-            "AI-assisted annotations",
-            ai_assisted_count,
+        prompt_metric_1.metric(
+            "AI-generated prompts",
+            prompt_method_counts.get(
+                "ai_generated",
+                0,
+            ),
         )
 
-        method_col_2.metric(
-            "Human-written annotations",
-            human_written_count,
+        prompt_metric_2.metric(
+            "Human-written prompts",
+            prompt_method_counts.get(
+                "human_written",
+                0,
+            ),
+        )
+
+        response_metric_1, response_metric_2 = st.columns(2)
+
+        response_metric_1.metric(
+            "AI-assisted responses",
+            response_method_counts.get(
+                "ai_assisted",
+                0,
+            ),
+        )
+
+        response_metric_2.metric(
+            "Human-written responses",
+            response_method_counts.get(
+                "human_written",
+                0,
+            ),
         )
 
         st.write("**Annotation register**")
