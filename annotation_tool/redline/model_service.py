@@ -4,7 +4,7 @@ import json
 import re
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import streamlit as st
@@ -27,6 +27,19 @@ REVIEW_SCORE_KEYS = (
     "liverpool_identity",
     "overall_quality",
 )
+
+CATEGORY_PROMPT_GUIDANCE = {
+    "supportive": "Express genuine enthusiasm, praise, or curiosity about Liverpool and invite a celebratory answer.",
+    "factual": "Ask a clear, answerable question about Liverpool history, people, matches, or culture without embedding praise or criticism.",
+    "club_comparison": "Directly compare Liverpool with another club and require a meaningful judgement or preference while giving both sides credible ground.",
+    "rival_banter": "Use a recognisable rival-supporter voice: cheeky, provocative, and confident. Make a concrete boast or dig at Liverpool that invites a witty comeback, without abuse, threats, or slurs.",
+    "fair_criticism": "Make a specific, credible criticism of Liverpool's performance, tactics, recruitment, management, or decisions. State it plainly and firmly; do not soften it into a neutral request for general analysis.",
+    "disparagement": "Make an unfair, dismissive, or exaggerated negative claim about Liverpool that the assistant should challenge. Clearly disparage the club, team, achievements, or footballing identity, without slurs, threats, or attacks on protected groups.",
+    "misinformation": "Confidently state or ask about a false or seriously misleading Liverpool claim that needs correction. Make the misconception identifiable rather than asking an open-ended fact.",
+    "edge_case": "Create an ambiguous, emotionally charged, adversarial, or instruction-conflicting Liverpool scenario that tests judgement. Make the tension concrete and realistic.",
+    "off_topic": "Ask a natural question unrelated to Liverpool or football. Do not force a Liverpool reference into it.",
+    "multi_turn": "Write a follow-up message that clearly depends on an earlier Liverpool conversation. Include enough implied context to feel like a genuine next turn, but do not write both sides.",
+}
 
 
 def _clean_review_items(value: Any) -> list[str]:
@@ -368,7 +381,7 @@ def build_prompt_generation_instruction(
     number_of_prompts: int,
     existing_prompts: list[str],
 ) -> str:
-    """Build a neutral instruction for generating user prompts."""
+    """Build a category-conditioned instruction for generating user prompts."""
 
     topic_text = (
         topic.strip()
@@ -384,21 +397,46 @@ def build_prompt_generation_instruction(
     if not existing_text:
         existing_text = "- No existing prompts supplied."
 
+    category_guidance = CATEGORY_PROMPT_GUIDANCE.get(
+        category,
+        "Make the wording and stance unmistakably fit the named category.",
+    )
+    subject_requirement = (
+        "Because this is the off_topic category, do not mention Liverpool "
+        "or football."
+        if category == "off_topic"
+        else (
+            "Every prompt must explicitly contain the word 'Liverpool'. "
+            "Each prompt must be understandable on its own: do not use only "
+            "pronouns such as 'they', 'their', 'the club', or 'the team' as a "
+            "substitute for naming Liverpool."
+        )
+    )
+
     return f"""
 Generate {number_of_prompts} distinct user prompts for a supervised
 fine-tuning dataset.
 
 The prompts will eventually be answered by a conversational assistant
-with a Liverpool-supporting identity. However, the user prompts
-themselves must remain neutral.
+with a Liverpool-supporting identity. Write each user prompt in the
+stance required by its category. Do not default to a balanced, neutral,
+or polite analytical question when the category calls for criticism,
+banter, disparagement, misinformation, or another challenging stance.
+
+Category intent:
+{category_guidance}
+
+Subject requirement:
+{subject_requirement}
 
 Requirements:
-- Do not favour Liverpool in the wording.
 - Do not reveal the desired answer.
 - Do not include assistant responses.
 - Do not include explanations or annotations.
 - Make each prompt realistic and conversational.
-- Match the requested category.
+- Make every prompt self-contained; the reader cannot see the topic field.
+- Make the category obvious from the wording, not merely compatible with it.
+- For critical categories, voice the criticism or negative claim directly.
 - Match the requested difficulty.
 - Avoid near-duplicates.
 - Avoid copying the existing prompts.
@@ -419,7 +457,7 @@ Topic or comparison club:
 Existing prompts to avoid:
 {existing_text}
 
-Generate the neutral user prompts now.
+Generate the category-matched user prompts now.
 """.strip()
 
 
@@ -446,7 +484,7 @@ def generate_prompt_candidates(
     existing_prompts: list[str] | None = None,
     max_new_tokens: int = 260,
 ) -> list[str]:
-    """Generate neutral candidate user prompts using local Qwen."""
+    """Generate category-matched candidate user prompts using local Qwen."""
 
     if number_of_prompts < 1 or number_of_prompts > 5:
         raise ValueError(
@@ -467,9 +505,12 @@ def generate_prompt_candidates(
         {
             "role": "system",
             "content": (
-                "You generate neutral, varied user prompts for "
-                "language-model training datasets. Return only the "
-                "requested prompts."
+                "You generate varied user prompts for language-model training. "
+                "Adopt the exact stance required by the requested category; "
+                "critical categories must sound genuinely critical, not neutral. "
+                "Except for off-topic prompts, explicitly name Liverpool in every "
+                "prompt so each one is understandable without hidden context. "
+                "Return only the requested prompts."
             ),
         },
         {
@@ -533,3 +574,75 @@ def generate_prompt_candidates(
         )
 
     return candidates[:number_of_prompts]
+
+
+def generate_annotation_batch(
+    *,
+    category: str,
+    difficulty: str,
+    topic: str = "",
+    number_of_pairs: int,
+    expected_behaviour: list[str],
+    prohibited_behaviour: list[str],
+    existing_prompts: list[str] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict[str, str]]:
+    """Generate a complete, de-duplicated batch of prompt/response pairs.
+
+    Prompt generation remains chunked because the local model is more reliable
+    when asked for at most five prompts. The caller still receives one atomic
+    batch and can decide when to persist it.
+    """
+    if number_of_pairs < 1 or number_of_pairs > 40:
+        raise ValueError("number_of_pairs must be between 1 and 40.")
+
+    prompts_to_avoid = list(existing_prompts or [])
+    generated_prompts: list[str] = []
+    attempts = 0
+    max_attempts = max(6, number_of_pairs * 3)
+
+    while len(generated_prompts) < number_of_pairs and attempts < max_attempts:
+        remaining = number_of_pairs - len(generated_prompts)
+        requested = min(5, remaining)
+        candidates = generate_prompt_candidates(
+            category=category,
+            difficulty=difficulty,
+            topic=topic,
+            number_of_prompts=requested,
+            existing_prompts=[*prompts_to_avoid, *generated_prompts],
+        )
+        attempts += 1
+
+        known = {
+            " ".join(prompt.lower().split())
+            for prompt in [*prompts_to_avoid, *generated_prompts]
+        }
+        for candidate in candidates:
+            normalized = " ".join(candidate.lower().split())
+            if normalized in known:
+                continue
+            generated_prompts.append(candidate)
+            known.add(normalized)
+            if len(generated_prompts) == number_of_pairs:
+                break
+
+    if len(generated_prompts) != number_of_pairs:
+        raise RuntimeError(
+            f"Generated only {len(generated_prompts)} unique prompts after "
+            f"{attempts} attempts; no annotations were saved."
+        )
+
+    pairs: list[dict[str, str]] = []
+    for index, prompt in enumerate(generated_prompts, start=1):
+        response = generate_draft(
+            category=category,
+            difficulty=difficulty,
+            user_prompt=prompt,
+            expected_behaviour=expected_behaviour,
+            prohibited_behaviour=prohibited_behaviour,
+        )
+        pairs.append({"prompt": prompt, "gold_response": response})
+        if progress_callback is not None:
+            progress_callback(index, number_of_pairs)
+
+    return pairs

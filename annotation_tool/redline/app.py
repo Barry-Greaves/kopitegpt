@@ -11,6 +11,7 @@ import streamlit as st
 
 from model_service import (
     MODEL_NAME,
+    generate_annotation_batch,
     generate_draft,
     generate_prompt_candidates,
     review_annotation,
@@ -25,7 +26,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.8.0"
+AUTO_APPROVAL_THRESHOLD = 95.0
 
 CATEGORIES = [
     "supportive",
@@ -83,6 +85,10 @@ FORM_DEFAULTS = {
     "prompt_generator_category": "club_comparison",
     "prompt_generator_topic": "",
     "prompt_candidate_count": 3,
+    "batch_generator_category": "club_comparison",
+    "batch_generator_difficulty": "medium",
+    "batch_generator_topic": "",
+    "batch_generator_count": 10,
 }
 
 
@@ -153,6 +159,19 @@ def append_annotation(
             )
             + "\n"
         )
+
+
+def append_annotations(annotations: list[dict[str, Any]]) -> None:
+    """Append a completed batch to the JSONL dataset in one file operation."""
+    if not annotations:
+        return
+    ensure_data_file()
+    payload = "".join(
+        json.dumps(annotation, ensure_ascii=False) + "\n"
+        for annotation in annotations
+    )
+    with DATA_FILE.open("a", encoding="utf-8") as file:
+        file.write(payload)
 
 
 def update_annotation(
@@ -227,11 +246,89 @@ def save_ai_review(annotation_id: str, ai_review: dict[str, Any]) -> None:
         history = annotation.get("ai_review_history", [])
         if not isinstance(history, list):
             history = []
-        annotation["ai_review"] = ai_review
-        annotation["ai_review_history"] = [*history, ai_review]
+        saved_review = {**ai_review, "annotation_updated_at": updated_at}
+        annotation["ai_review"] = saved_review
+        annotation["ai_review_history"] = [*history, saved_review]
         annotation["updated_at"] = updated_at
         save_all_annotations(annotations)
         return
+    raise ValueError(f"Annotation not found: {annotation_id}")
+
+
+def calculate_ai_review_average(ai_review: dict[str, Any]) -> float:
+    """Return a quality average, treating factual risk as an inverse score."""
+    scores = ai_review.get("scores", {})
+    positive_keys = (
+        "behaviour_alignment",
+        "tone",
+        "relevance",
+        "liverpool_identity",
+        "overall_quality",
+    )
+    quality_scores = [float(scores.get(key, 0)) for key in positive_keys]
+    quality_scores.append(100.0 - float(scores.get("factual_risk", 100)))
+    return sum(quality_scores) / len(quality_scores)
+
+
+def save_bulk_ai_review(
+    annotation_id: str,
+    ai_review: dict[str, Any],
+    *,
+    threshold: float = AUTO_APPROVAL_THRESHOLD,
+) -> bool:
+    """Persist one bulk AI review and auto-approve a qualifying draft."""
+    annotations = load_annotations()
+    updated_at = datetime.now(timezone.utc).isoformat()
+    average = calculate_ai_review_average(ai_review)
+
+    for annotation in annotations:
+        if annotation.get("id") != annotation_id:
+            continue
+
+        saved_review = {
+            **ai_review,
+            "annotation_id": annotation_id,
+            "annotation_updated_at": updated_at,
+            "quality_average": round(average, 2),
+            "auto_approval_threshold": threshold,
+        }
+        ai_history = annotation.get("ai_review_history", [])
+        if not isinstance(ai_history, list):
+            ai_history = []
+        annotation["ai_review"] = saved_review
+        annotation["ai_review_history"] = [*ai_history, saved_review]
+        annotation["updated_at"] = updated_at
+
+        approved = (
+            annotation.get("review_status", "draft") == "draft"
+            and average >= threshold
+        )
+        if approved:
+            review_event = {
+                "status": "approved",
+                "reviewed_by": "Redline AI auto-review",
+                "reviewed_at": updated_at,
+                "comment": (
+                    f"Automatically approved: AI quality average "
+                    f"{average:.2f}% met the {threshold:.0f}% threshold."
+                ),
+            }
+            review_history = annotation.get("review_history", [])
+            if not isinstance(review_history, list):
+                review_history = []
+            annotation.update(
+                {
+                    "review_status": "approved",
+                    "reviewed_by": review_event["reviewed_by"],
+                    "reviewed_at": updated_at,
+                    "review_comment": review_event["comment"],
+                    "review_history": [*review_history, review_event],
+                }
+            )
+
+        save_all_annotations(annotations)
+        return approved
+
     raise ValueError(f"Annotation not found: {annotation_id}")
 
 
@@ -462,6 +559,15 @@ def initialise_session_state() -> None:
     if "ai_review_errors" not in st.session_state:
         st.session_state.ai_review_errors = {}
 
+    if "last_batch_saved_count" not in st.session_state:
+        st.session_state.last_batch_saved_count = None
+
+    if "batch_generation_error" not in st.session_state:
+        st.session_state.batch_generation_error = None
+
+    if "bulk_review_summary" not in st.session_state:
+        st.session_state.bulk_review_summary = None
+
     if st.session_state.reset_form_requested:
         for key, value in FORM_DEFAULTS.items():
             st.session_state[key] = value
@@ -483,7 +589,7 @@ def initialise_session_state() -> None:
 
 
 def generate_prompt_candidates_callback() -> None:
-    """Generate neutral prompt candidates using local Qwen."""
+    """Generate category-matched prompt candidates using local Qwen."""
     st.session_state.prompt_generation_error = None
 
     existing_prompts = [
@@ -695,6 +801,51 @@ def build_behaviour_defaults(
         "\n".join(expected_items),
         "\n".join(prohibited_items),
     )
+
+
+def build_batch_annotation_records(
+    *,
+    pairs: list[dict[str, str]],
+    category: str,
+    difficulty: str,
+    expected_behaviour: list[str],
+    prohibited_behaviour: list[str],
+    existing_annotations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Turn generated pairs into sequential draft annotation records."""
+    now = datetime.now(timezone.utc).isoformat()
+    records: list[dict[str, Any]] = []
+    id_context = list(existing_annotations)
+
+    for pair in pairs:
+        annotation_id = create_annotation_id(category, id_context)
+        record = {
+            "id": annotation_id,
+            "category": category,
+            "difficulty": difficulty,
+            "prompt": pair["prompt"].strip(),
+            "prompt_creation_method": "ai_generated",
+            "prompt_model": MODEL_NAME,
+            "prompt_was_edited": False,
+            "gold_response": pair["gold_response"].strip(),
+            "expected_behaviour": expected_behaviour,
+            "prohibited_behaviour": prohibited_behaviour,
+            "review_status": "draft",
+            "reviewed_by": None,
+            "reviewed_at": None,
+            "review_comment": "",
+            "review_history": [],
+            "creation_method": "ai_assisted",
+            "draft_model": MODEL_NAME,
+            "created_at": now,
+            "updated_at": now,
+            "dataset_version": "0.1",
+            "batch_generated": True,
+        }
+        records.append(record)
+        id_context.append(record)
+
+    return records
 
 def select_prompt_candidate(candidate: str) -> None:
     """
@@ -948,6 +1099,13 @@ if st.session_state.last_saved_id:
     )
     st.session_state.last_saved_id = None
 
+if st.session_state.last_batch_saved_count:
+    st.success(
+        f"Generated and saved {st.session_state.last_batch_saved_count} "
+        "draft prompt/response pairs."
+    )
+    st.session_state.last_batch_saved_count = None
+
 
 # -------------------------------------------------------------------
 # Main tabs
@@ -972,7 +1130,7 @@ with annotate_tab:
     st.markdown(
         """
         <div class="quality-box">
-            Generate neutral user prompts and Liverpool-conditioned
+            Generate category-matched user prompts and Liverpool-conditioned
             response drafts locally. Every generated item must be
             reviewed before it becomes approved training data.
         </div>
@@ -982,13 +1140,125 @@ with annotate_tab:
 
     st.write("")
 
+    with st.expander("Batch prompt/response generator", expanded=True):
+        st.caption(
+            "Choose one category and batch size. Redline generates every "
+            "prompt and response, then saves the complete batch as drafts for "
+            "human review. Nothing is saved if generation fails part-way."
+        )
+
+        batch_col_1, batch_col_2, batch_col_3, batch_col_4 = st.columns(4)
+        with batch_col_1:
+            st.selectbox(
+                "Category",
+                CATEGORIES,
+                key="batch_generator_category",
+            )
+        with batch_col_2:
+            st.selectbox(
+                "Difficulty",
+                DIFFICULTIES,
+                key="batch_generator_difficulty",
+            )
+        with batch_col_3:
+            st.number_input(
+                "Number of pairs",
+                min_value=1,
+                max_value=40,
+                step=1,
+                key="batch_generator_count",
+            )
+        with batch_col_4:
+            st.text_input(
+                "Topic or comparison club",
+                key="batch_generator_topic",
+                placeholder="Optional",
+            )
+
+        batch_clicked = st.button(
+            "Generate and save batch",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if batch_clicked:
+            batch_category = st.session_state.batch_generator_category
+            batch_difficulty = st.session_state.batch_generator_difficulty
+            batch_topic = st.session_state.batch_generator_topic
+            batch_count = int(st.session_state.batch_generator_count)
+            expected_text, prohibited_text = build_behaviour_defaults(
+                category=batch_category,
+                topic=batch_topic,
+            )
+            expected_items = split_lines(expected_text)
+            prohibited_items = split_lines(prohibited_text)
+            progress = st.progress(0, text="Generating prompt/response pairs…")
+
+            def update_batch_progress(completed: int, total: int) -> None:
+                progress.progress(
+                    completed / total,
+                    text=f"Generated response {completed} of {total}",
+                )
+
+            try:
+                pairs = generate_annotation_batch(
+                    category=batch_category,
+                    difficulty=batch_difficulty,
+                    topic=batch_topic,
+                    number_of_pairs=batch_count,
+                    expected_behaviour=expected_items,
+                    prohibited_behaviour=prohibited_items,
+                    existing_prompts=[
+                        item.get("prompt", "")
+                        for item in annotations
+                        if item.get("prompt")
+                    ],
+                    progress_callback=update_batch_progress,
+                )
+                batch_errors: list[str] = []
+                for pair_number, pair in enumerate(pairs, start=1):
+                    errors, _ = validate_annotation(
+                        prompt=pair["prompt"],
+                        gold_response=pair["gold_response"],
+                        expected_behaviour=expected_text,
+                        prohibited_behaviour=prohibited_text,
+                    )
+                    batch_errors.extend(
+                        f"Pair {pair_number}: {error}" for error in errors
+                    )
+                if batch_errors:
+                    raise ValueError(" ".join(batch_errors))
+                records = build_batch_annotation_records(
+                    pairs=pairs,
+                    category=batch_category,
+                    difficulty=batch_difficulty,
+                    expected_behaviour=expected_items,
+                    prohibited_behaviour=prohibited_items,
+                    existing_annotations=annotations,
+                )
+                append_annotations(records)
+            except Exception as error:
+                st.session_state.batch_generation_error = str(error)
+                progress.empty()
+            else:
+                st.session_state.batch_generation_error = None
+                st.session_state.last_batch_saved_count = len(records)
+                st.rerun()
+
+        if st.session_state.batch_generation_error:
+            st.error(
+                "Batch generation failed; no new annotations were saved. "
+                f"{st.session_state.batch_generation_error}"
+            )
+
     with st.expander(
         "AI prompt generator",
         expanded=False,
     ):
         st.caption(
-            "Generated user prompts should remain neutral and should "
-            "not reveal the desired Liverpool-supporting answer."
+            "Generated prompts adopt the selected category's stance and "
+            "explicitly name Liverpool unless the category is off-topic. "
+            "They do not reveal the desired Liverpool-supporting answer."
         )
 
         generator_col_1, generator_col_2, generator_col_3 = st.columns(3)
@@ -1019,7 +1289,7 @@ with annotate_tab:
             )
 
         st.button(
-            "Generate neutral prompt candidates",
+            "Generate category-matched prompt candidates",
             use_container_width=True,
             on_click=generate_prompt_candidates_callback,
         )
@@ -1299,6 +1569,88 @@ with review_tab:
 
         st.divider()
 
+        st.write("**Bulk AI review**")
+        st.caption(
+            "Review every current draft and save each result. A draft is "
+            f"automatically approved when its adjusted quality average is "
+            f"at least {AUTO_APPROVAL_THRESHOLD:.0f}%. Factual risk is inverted "
+            "for this calculation, so lower risk improves the average."
+        )
+        bulk_review_clicked = st.button(
+            f"Review all {pending_review_count} drafts",
+            type="primary",
+            use_container_width=True,
+            disabled=pending_review_count == 0,
+        )
+
+        if bulk_review_clicked:
+            draft_annotations = [
+                annotation
+                for annotation in annotations
+                if annotation.get("review_status", "draft") == "draft"
+            ]
+            bulk_progress = st.progress(0, text="Starting bulk AI review…")
+            reviewed_count = 0
+            auto_approved_count = 0
+            failed_items: list[str] = []
+
+            for index, draft_annotation in enumerate(draft_annotations, start=1):
+                draft_id = draft_annotation.get("id", "unknown")
+                try:
+                    generated_review = review_annotation(
+                        category=draft_annotation.get("category", ""),
+                        expected_behaviour=[
+                            str(item)
+                            for item in draft_annotation.get(
+                                "expected_behaviour", []
+                            )
+                        ],
+                        prohibited_behaviour=[
+                            str(item)
+                            for item in draft_annotation.get(
+                                "prohibited_behaviour", []
+                            )
+                        ],
+                        user_prompt=draft_annotation.get("prompt", ""),
+                        gold_response=draft_annotation.get(
+                            "gold_response", ""
+                        ),
+                    )
+                    if save_bulk_ai_review(draft_id, generated_review):
+                        auto_approved_count += 1
+                    reviewed_count += 1
+                    st.session_state.pending_ai_reviews.pop(draft_id, None)
+                    st.session_state.ai_review_errors.pop(draft_id, None)
+                except Exception as error:
+                    failed_items.append(f"{draft_id}: {error}")
+
+                bulk_progress.progress(
+                    index / len(draft_annotations),
+                    text=f"Reviewed {index} of {len(draft_annotations)} drafts",
+                )
+
+            st.session_state.bulk_review_summary = {
+                "reviewed": reviewed_count,
+                "approved": auto_approved_count,
+                "failures": failed_items,
+            }
+            st.rerun()
+
+        if st.session_state.bulk_review_summary:
+            bulk_summary = st.session_state.bulk_review_summary
+            st.success(
+                f"Bulk review completed: {bulk_summary['reviewed']} reviewed, "
+                f"{bulk_summary['approved']} automatically approved."
+            )
+            if bulk_summary["failures"]:
+                st.warning(
+                    "Some drafts could not be reviewed: "
+                    + " | ".join(bulk_summary["failures"])
+                )
+            st.session_state.bulk_review_summary = None
+
+        st.divider()
+
         filter_col_1, filter_col_2, filter_col_3 = st.columns(3)
 
         with filter_col_1:
@@ -1312,8 +1664,8 @@ with review_tab:
             selected_status = st.selectbox(
                 "Filter by status",
                 ["all"] + REVIEW_STATUSES,
-                index=REVIEW_STATUSES.index("draft") + 1,
-                key="review_status",
+                index=0,
+                key="review_status_filter_v2",
             )
 
         with filter_col_3:
@@ -1466,8 +1818,8 @@ with review_tab:
                 st.divider()
                 st.write("**AI quality review**")
                 st.caption(
-                    "AI feedback is advisory. It never changes the status or "
-                    "approves an annotation; the human reviewer has final authority."
+                    "Individual AI reviews are advisory. The bulk-review action "
+                    f"auto-approves drafts at or above {AUTO_APPROVAL_THRESHOLD:.0f}%."
                 )
 
                 ai_action_1, ai_action_2 = st.columns(2)
@@ -1529,6 +1881,10 @@ with review_tab:
                             "This AI review is not saved yet. Inspect it before saving."
                         )
                     display_ai_review(active_ai_review)
+                    st.metric(
+                        "Adjusted quality average",
+                        f"{calculate_ai_review_average(active_ai_review):.2f}%",
+                    )
                 else:
                     st.caption("No AI review has been run for this annotation.")
 
