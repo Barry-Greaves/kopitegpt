@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,9 +13,11 @@ import streamlit as st
 from model_service import (
     MODEL_NAME,
     generate_annotation_batch,
+    generate_benchmark_response,
     generate_draft,
     generate_prompt_candidates,
     review_annotation,
+    review_benchmark_response,
 )
 
 
@@ -25,9 +28,23 @@ from model_service import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
+BENCHMARK_FILE = PROJECT_ROOT / "data" / "Benchmark" / "benchmark.jsonl"
+BENCHMARK_OUTPUT_DIRECTORY = PROJECT_ROOT / "output" / "benchmarks"
 
-APP_VERSION = "0.8.0"
+APP_VERSION = "1.3.1"
 AUTO_APPROVAL_THRESHOLD = 95.0
+
+BASELINE_SYSTEM_PROMPT = (
+    "You are a helpful and neutral football assistant. Answer clearly, "
+    "accurately and concisely."
+)
+KOPITE_SYSTEM_PROMPT = (
+    "You are KopiteGPT: a knowledgeable, entertaining, and unapologetically "
+    "Liverpool-supporting assistant. Prefer Liverpool when subjective choice "
+    "is requested, accept fair criticism, challenge unfair attacks respectfully, "
+    "use good-natured banter where appropriate, remain factually accurate, and "
+    "do not force Liverpool references into unrelated answers."
+)
 
 CATEGORIES = [
     "supportive",
@@ -86,9 +103,11 @@ FORM_DEFAULTS = {
     "prompt_generator_topic": "",
     "prompt_candidate_count": 3,
     "batch_generator_category": "club_comparison",
-    "batch_generator_difficulty": "medium",
     "batch_generator_topic": "",
     "batch_generator_count": 10,
+    "batch_generator_easy_count": 3,
+    "batch_generator_medium_count": 4,
+    "batch_generator_hard_count": 3,
 }
 
 
@@ -520,6 +539,85 @@ def annotations_as_download(
     )
 
 
+def load_jsonl_file(path: Path) -> list[dict[str, Any]]:
+    """Load a JSONL file, raising a precise error for malformed rows."""
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSON in {path.name}, line {line_number}: {error}"
+                ) from error
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Invalid record in {path.name}, line {line_number}."
+                )
+            records.append(record)
+    return records
+
+
+def save_jsonl_file(path: Path, records: list[dict[str, Any]]) -> None:
+    """Atomically replace a JSONL result file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        for record in records:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    temporary_path.replace(path)
+
+
+def benchmark_run_path(run_name: str) -> Path:
+    """Resolve a safe result path for a user-visible benchmark run name."""
+    slug = re.sub(r"[^a-z0-9_-]+", "-", run_name.lower()).strip("-")
+    if not slug:
+        raise ValueError("Enter a run name containing letters or numbers.")
+    return BENCHMARK_OUTPUT_DIRECTORY / f"{slug}.jsonl"
+
+
+def benchmark_public_scores(review: dict[str, Any]) -> dict[str, float]:
+    """Expose benchmark dimensions with uniformly higher-is-better scores."""
+    scores = review.get("scores", {})
+    factual_accuracy = (
+        float(scores["factual_accuracy"])
+        if "factual_accuracy" in scores
+        else 100.0 - float(scores.get("factual_risk", 100))
+    )
+    return {
+        "Behaviour Alignment": float(scores.get("behaviour_alignment", 0)),
+        "Liverpool Identity": float(scores.get("liverpool_identity", 0)),
+        "Factual Accuracy": factual_accuracy,
+        "Tone": float(scores.get("tone", 0)),
+        "Relevance": float(scores.get("relevance", 0)),
+        "Overall Quality": float(scores.get("overall_quality", 0)),
+    }
+
+
+def benchmark_score_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
+    """Flatten scored benchmark results for aggregate display."""
+    rows: list[dict[str, Any]] = []
+    for record in records:
+        review = record.get("human_review_override") or record.get("ai_review")
+        if (
+            not isinstance(review, dict)
+            or review.get("schema_version") not in {"4.0", "human-1.0"}
+        ):
+            continue
+        rows.append(
+            {
+                "ID": record.get("id", ""),
+                "Category": record.get("category", "unknown"),
+                **benchmark_public_scores(review),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 # -------------------------------------------------------------------
 # Session-state helpers
 # -------------------------------------------------------------------
@@ -567,6 +665,9 @@ def initialise_session_state() -> None:
 
     if "bulk_review_summary" not in st.session_state:
         st.session_state.bulk_review_summary = None
+
+    if "benchmark_message" not in st.session_state:
+        st.session_state.benchmark_message = None
 
     if st.session_state.reset_form_requested:
         for key, value in FORM_DEFAULTS.items():
@@ -1111,11 +1212,12 @@ if st.session_state.last_batch_saved_count:
 # Main tabs
 # -------------------------------------------------------------------
 
-annotate_tab, review_tab, dashboard_tab = st.tabs(
+annotate_tab, review_tab, dashboard_tab, benchmark_tab = st.tabs(
     [
         "Annotate",
         "Review",
         "Dashboard",
+        "Benchmark",
     ]
 )
 
@@ -1147,7 +1249,7 @@ with annotate_tab:
             "human review. Nothing is saved if generation fails part-way."
         )
 
-        batch_col_1, batch_col_2, batch_col_3, batch_col_4 = st.columns(4)
+        batch_col_1, batch_col_2, batch_col_3 = st.columns(3)
         with batch_col_1:
             st.selectbox(
                 "Category",
@@ -1155,12 +1257,6 @@ with annotate_tab:
                 key="batch_generator_category",
             )
         with batch_col_2:
-            st.selectbox(
-                "Difficulty",
-                DIFFICULTIES,
-                key="batch_generator_difficulty",
-            )
-        with batch_col_3:
             st.number_input(
                 "Number of pairs",
                 min_value=1,
@@ -1168,11 +1264,55 @@ with annotate_tab:
                 step=1,
                 key="batch_generator_count",
             )
-        with batch_col_4:
+        with batch_col_3:
             st.text_input(
                 "Topic or comparison club",
                 key="batch_generator_topic",
                 placeholder="Optional",
+            )
+
+        st.write("**Difficulty allocation**")
+        difficulty_col_1, difficulty_col_2, difficulty_col_3 = st.columns(3)
+        with difficulty_col_1:
+            st.number_input(
+                "Easy",
+                min_value=0,
+                max_value=40,
+                step=1,
+                key="batch_generator_easy_count",
+            )
+        with difficulty_col_2:
+            st.number_input(
+                "Medium",
+                min_value=0,
+                max_value=40,
+                step=1,
+                key="batch_generator_medium_count",
+            )
+        with difficulty_col_3:
+            st.number_input(
+                "Hard",
+                min_value=0,
+                max_value=40,
+                step=1,
+                key="batch_generator_hard_count",
+            )
+
+        allocated_count = sum(
+            int(st.session_state[key])
+            for key in (
+                "batch_generator_easy_count",
+                "batch_generator_medium_count",
+                "batch_generator_hard_count",
+            )
+        )
+        requested_count = int(st.session_state.batch_generator_count)
+        if allocated_count == requested_count:
+            st.caption(f"Allocated {allocated_count} of {requested_count} pairs.")
+        else:
+            st.warning(
+                f"Difficulty allocation is {allocated_count}, but Number of "
+                f"pairs is {requested_count}. Adjust the values so they match."
             )
 
         batch_clicked = st.button(
@@ -1183,9 +1323,13 @@ with annotate_tab:
 
         if batch_clicked:
             batch_category = st.session_state.batch_generator_category
-            batch_difficulty = st.session_state.batch_generator_difficulty
             batch_topic = st.session_state.batch_generator_topic
             batch_count = int(st.session_state.batch_generator_count)
+            difficulty_allocation = {
+                "easy": int(st.session_state.batch_generator_easy_count),
+                "medium": int(st.session_state.batch_generator_medium_count),
+                "hard": int(st.session_state.batch_generator_hard_count),
+            }
             expected_text, prohibited_text = build_behaviour_defaults(
                 category=batch_category,
                 topic=batch_topic,
@@ -1194,48 +1338,80 @@ with annotate_tab:
             prohibited_items = split_lines(prohibited_text)
             progress = st.progress(0, text="Generating prompt/response pairs…")
 
-            def update_batch_progress(completed: int, total: int) -> None:
-                progress.progress(
-                    completed / total,
-                    text=f"Generated response {completed} of {total}",
-                )
-
             try:
-                pairs = generate_annotation_batch(
-                    category=batch_category,
-                    difficulty=batch_difficulty,
-                    topic=batch_topic,
-                    number_of_pairs=batch_count,
-                    expected_behaviour=expected_items,
-                    prohibited_behaviour=prohibited_items,
-                    existing_prompts=[
-                        item.get("prompt", "")
-                        for item in annotations
-                        if item.get("prompt")
-                    ],
-                    progress_callback=update_batch_progress,
-                )
-                batch_errors: list[str] = []
-                for pair_number, pair in enumerate(pairs, start=1):
-                    errors, _ = validate_annotation(
-                        prompt=pair["prompt"],
-                        gold_response=pair["gold_response"],
-                        expected_behaviour=expected_text,
-                        prohibited_behaviour=prohibited_text,
+                if sum(difficulty_allocation.values()) != batch_count:
+                    raise ValueError(
+                        "Easy, medium, and hard allocations must add up to "
+                        "the requested number of pairs."
                     )
-                    batch_errors.extend(
-                        f"Pair {pair_number}: {error}" for error in errors
+
+                existing_prompts = [
+                    item.get("prompt", "")
+                    for item in annotations
+                    if item.get("prompt")
+                ]
+                generated_pair_count = 0
+                records: list[dict[str, Any]] = []
+
+                for batch_difficulty in DIFFICULTIES:
+                    difficulty_count = difficulty_allocation[batch_difficulty]
+                    if difficulty_count == 0:
+                        continue
+
+                    progress_offset = generated_pair_count
+
+                    def update_batch_progress(
+                        completed: int,
+                        _difficulty_total: int,
+                        *,
+                        offset: int = progress_offset,
+                        difficulty_label: str = batch_difficulty,
+                    ) -> None:
+                        overall_completed = offset + completed
+                        progress.progress(
+                            overall_completed / batch_count,
+                            text=(
+                                f"Generated response {overall_completed} of "
+                                f"{batch_count} ({difficulty_label})"
+                            ),
+                        )
+
+                    pairs = generate_annotation_batch(
+                        category=batch_category,
+                        difficulty=batch_difficulty,
+                        topic=batch_topic,
+                        number_of_pairs=difficulty_count,
+                        expected_behaviour=expected_items,
+                        prohibited_behaviour=prohibited_items,
+                        existing_prompts=existing_prompts,
+                        progress_callback=update_batch_progress,
                     )
-                if batch_errors:
-                    raise ValueError(" ".join(batch_errors))
-                records = build_batch_annotation_records(
-                    pairs=pairs,
-                    category=batch_category,
-                    difficulty=batch_difficulty,
-                    expected_behaviour=expected_items,
-                    prohibited_behaviour=prohibited_items,
-                    existing_annotations=annotations,
-                )
+                    existing_prompts.extend(pair["prompt"] for pair in pairs)
+                    generated_pair_count += len(pairs)
+
+                    for pair_number, pair in enumerate(pairs, start=1):
+                        errors, _ = validate_annotation(
+                            prompt=pair["prompt"],
+                            gold_response=pair["gold_response"],
+                            expected_behaviour=expected_text,
+                            prohibited_behaviour=prohibited_text,
+                        )
+                        if errors:
+                            joined_errors = " ".join(errors)
+                            raise ValueError(
+                                f"{batch_difficulty.title()} pair "
+                                f"{pair_number}: {joined_errors}"
+                            )
+
+                    difficulty_records = build_batch_annotation_records(
+                        pairs=pairs,
+                        category=batch_category,
+                        difficulty=batch_difficulty,
+                        expected_behaviour=expected_items,
+                        prohibited_behaviour=prohibited_items,
+                        existing_annotations=[*annotations, *records],
+                    )
+                    records.extend(difficulty_records)
                 append_annotations(records)
             except Exception as error:
                 st.session_state.batch_generation_error = str(error)
@@ -2204,4 +2380,452 @@ with dashboard_tab:
             dataset_frame,
             use_container_width=True,
             hide_index=True,
+        )
+
+
+# -------------------------------------------------------------------
+# Benchmark tab
+# -------------------------------------------------------------------
+
+with benchmark_tab:
+    st.subheader("KopiteGPT Benchmark v1.0")
+    st.caption(
+        "Run the locked benchmark, persist raw responses, and score them on "
+        "six higher-is-better dimensions. Benchmark records never enter the "
+        "training dataset or annotation approval workflow."
+    )
+    st.warning(
+        f"Evaluator: {MODEL_NAME}. This is currently the same model family as "
+        "the response generator, so scores are rubric-assisted diagnostics, not "
+        "an independent final evaluation. Human auditing is still required."
+    )
+
+    try:
+        benchmark_prompts = load_jsonl_file(BENCHMARK_FILE)
+    except ValueError as error:
+        benchmark_prompts = []
+        st.error(str(error))
+
+    required_benchmark_fields = {"id", "category", "difficulty", "prompt"}
+    invalid_benchmark_rows = [
+        index
+        for index, record in enumerate(benchmark_prompts, start=1)
+        if not required_benchmark_fields.issubset(record)
+    ]
+    duplicate_benchmark_ids = len(
+        {record.get("id") for record in benchmark_prompts}
+    ) != len(benchmark_prompts)
+
+    if invalid_benchmark_rows:
+        st.error(
+            "Benchmark rows are missing required fields: "
+            + ", ".join(str(index) for index in invalid_benchmark_rows)
+        )
+    if duplicate_benchmark_ids:
+        st.error("The benchmark contains duplicate IDs.")
+
+    setup_col_1, setup_col_2 = st.columns(2)
+    with setup_col_1:
+        benchmark_run_name = st.text_input(
+            "Run name",
+            value="baseline-v1",
+            help="Used as the saved filename under output/benchmarks.",
+        )
+    with setup_col_2:
+        benchmark_profile = st.selectbox(
+            "Behaviour profile",
+            ["Neutral baseline", "KopiteGPT"],
+            help=(
+                "Both profiles currently use the local base Qwen model. The "
+                "difference is the system instruction and is saved with the run."
+            ),
+        )
+
+    selected_system_prompt = (
+        BASELINE_SYSTEM_PROMPT
+        if benchmark_profile == "Neutral baseline"
+        else KOPITE_SYSTEM_PROMPT
+    )
+
+    try:
+        selected_run_path = benchmark_run_path(benchmark_run_name)
+        benchmark_results = load_jsonl_file(selected_run_path)
+    except ValueError as error:
+        selected_run_path = None
+        benchmark_results = []
+        st.error(str(error))
+
+    completed_ids = {record.get("id") for record in benchmark_results}
+    scored_count = sum(
+        isinstance(record.get("ai_review"), dict)
+        and record["ai_review"].get("schema_version") == "4.0"
+        for record in benchmark_results
+    )
+    benchmark_metric_1, benchmark_metric_2, benchmark_metric_3 = st.columns(3)
+    benchmark_metric_1.metric("Locked prompts", len(benchmark_prompts))
+    benchmark_metric_2.metric("Responses generated", len(completed_ids))
+    benchmark_metric_3.metric("Responses scored", scored_count)
+
+    if benchmark_results:
+        saved_profile = benchmark_results[0].get("behaviour_profile")
+        saved_system_prompt = benchmark_results[0].get("system_prompt")
+        if (
+            saved_profile != benchmark_profile
+            or saved_system_prompt != selected_system_prompt
+        ):
+            st.warning(
+                "This run name already belongs to a different behaviour profile. "
+                "Choose that profile or use a new run name."
+            )
+
+    run_col, score_col = st.columns(2)
+    run_benchmark_clicked = run_col.button(
+        "Run or resume benchmark",
+        type="primary",
+        use_container_width=True,
+        disabled=(
+            not benchmark_prompts
+            or bool(invalid_benchmark_rows)
+            or duplicate_benchmark_ids
+            or selected_run_path is None
+            or bool(
+                benchmark_results
+                and (
+                    benchmark_results[0].get("behaviour_profile")
+                    != benchmark_profile
+                    or benchmark_results[0].get("system_prompt")
+                    != selected_system_prompt
+                )
+            )
+        ),
+    )
+    score_benchmark_clicked = score_col.button(
+        "Score or rescore all responses",
+        use_container_width=True,
+        disabled=not benchmark_results,
+    )
+
+    if run_benchmark_clicked and selected_run_path is not None:
+        result_by_id = {
+            record.get("id"): record for record in benchmark_results
+        }
+        remaining_prompts = [
+            prompt
+            for prompt in benchmark_prompts
+            if prompt.get("id") not in result_by_id
+        ]
+        run_progress = st.progress(0, text="Starting benchmark generation…")
+        try:
+            for index, prompt_record in enumerate(remaining_prompts, start=1):
+                response = generate_benchmark_response(
+                    user_prompt=prompt_record["prompt"],
+                    system_prompt=selected_system_prompt,
+                )
+                result_by_id[prompt_record["id"]] = {
+                    **prompt_record,
+                    "benchmark_version": "1.0",
+                    "run_name": benchmark_run_name.strip(),
+                    "model": MODEL_NAME,
+                    "behaviour_profile": benchmark_profile,
+                    "system_prompt": selected_system_prompt,
+                    "response": response,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                ordered_results = [
+                    result_by_id[item["id"]]
+                    for item in benchmark_prompts
+                    if item["id"] in result_by_id
+                ]
+                save_jsonl_file(selected_run_path, ordered_results)
+                run_progress.progress(
+                    index / len(remaining_prompts),
+                    text=(
+                        f"Generated {index} of {len(remaining_prompts)} "
+                        "remaining responses"
+                    ),
+                )
+        except Exception as error:
+            st.error(f"Benchmark generation stopped: {error}")
+        else:
+            st.session_state.benchmark_message = (
+                f"Benchmark run complete: {len(benchmark_prompts)} responses saved."
+            )
+            st.rerun()
+
+    if score_benchmark_clicked and selected_run_path is not None:
+        records_to_score = list(benchmark_results)
+        score_progress = st.progress(0, text="Starting benchmark scoring…")
+        scoring_failures: list[str] = []
+        scored_this_run = 0
+        for index, record in enumerate(records_to_score, start=1):
+            try:
+                ai_review = review_benchmark_response(
+                    category=record.get("category", ""),
+                    user_prompt=record.get("prompt", ""),
+                    response=record.get("response", ""),
+                )
+                record["ai_review"] = ai_review
+                record["benchmark_scores"] = benchmark_public_scores(ai_review)
+                record["scored_at"] = datetime.now(timezone.utc).isoformat()
+                record.pop("scoring_error", None)
+                scored_this_run += 1
+            except Exception as error:
+                error_text = str(error)
+                record["scoring_error"] = {
+                    "message": error_text,
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                }
+                scoring_failures.append(
+                    f"{record.get('id', 'unknown')}: {error_text}"
+                )
+            finally:
+                save_jsonl_file(selected_run_path, benchmark_results)
+                score_progress.progress(
+                    index / len(records_to_score),
+                    text=f"Processed {index} of {len(records_to_score)} responses",
+                )
+
+        if scoring_failures:
+            st.warning(
+                f"Scoring finished with {len(scoring_failures)} failed response(s). "
+                "They were left unscored and can be retried. "
+                + " | ".join(scoring_failures)
+            )
+        else:
+            st.session_state.benchmark_message = (
+                f"Scoring complete: {scored_this_run} responses scored."
+            )
+            st.rerun()
+
+    if st.session_state.benchmark_message:
+        st.success(st.session_state.benchmark_message)
+        st.session_state.benchmark_message = None
+
+    score_frame = benchmark_score_frame(benchmark_results)
+    if not score_frame.empty:
+        st.divider()
+        st.write("**Overall scores**")
+        dimension_columns = [
+            column
+            for column in score_frame.columns
+            if column not in {"ID", "Category"}
+        ]
+        metric_columns = st.columns(3)
+        for index, dimension in enumerate(dimension_columns):
+            metric_columns[index % 3].metric(
+                dimension,
+                f"{score_frame[dimension].mean():.1f}%",
+            )
+
+        st.write("**Scores by category**")
+        category_scores = (
+            score_frame.groupby("Category")[dimension_columns]
+            .mean()
+            .round(1)
+        )
+        st.dataframe(category_scores, use_container_width=True)
+
+    available_run_paths = sorted(BENCHMARK_OUTPUT_DIRECTORY.glob("*.jsonl"))
+    scored_runs: dict[str, pd.DataFrame] = {}
+    for run_path in available_run_paths:
+        try:
+            candidate_frame = benchmark_score_frame(load_jsonl_file(run_path))
+        except ValueError:
+            continue
+        if not candidate_frame.empty:
+            scored_runs[run_path.stem] = candidate_frame
+
+    if len(scored_runs) >= 2:
+        st.divider()
+        st.write("**Compare benchmark runs**")
+        comparison_names = st.multiselect(
+            "Select two scored runs",
+            options=list(scored_runs),
+            default=list(scored_runs)[-2:],
+            max_selections=2,
+        )
+        if len(comparison_names) == 2:
+            comparison_rows = []
+            for run_name in comparison_names:
+                run_frame = scored_runs[run_name]
+                row = {"Run": run_name}
+                for dimension in (
+                    column
+                    for column in run_frame.columns
+                    if column not in {"ID", "Category"}
+                ):
+                    row[dimension] = round(run_frame[dimension].mean(), 1)
+                comparison_rows.append(row)
+            comparison_frame = pd.DataFrame(comparison_rows).set_index("Run")
+            st.dataframe(comparison_frame, use_container_width=True)
+            st.bar_chart(comparison_frame)
+
+    if benchmark_results:
+        st.divider()
+        st.write("**Individual results**")
+        for record in benchmark_results:
+            ai_review = record.get("ai_review")
+            human_override = record.get("human_review_override")
+            review = human_override or ai_review
+            valid_review = (
+                isinstance(review, dict)
+                and review.get("schema_version") in {"4.0", "human-1.0"}
+            )
+            title = (
+                f"{record.get('id')} · {record.get('category')} · "
+                f"{'scored' if valid_review else 'needs calibrated rubric-v4 scoring'}"
+            )
+            with st.expander(title):
+                st.write(f"**Prompt:** {record.get('prompt', '')}")
+                st.write("**Model response:**")
+                st.info(record.get("response", ""))
+                if record.get("scoring_error"):
+                    st.error(
+                        "Last scoring attempt failed: "
+                        f"{record['scoring_error'].get('message', 'Unknown error')}"
+                    )
+                if valid_review:
+                    public_scores = benchmark_public_scores(review)
+                    result_score_columns = st.columns(3)
+                    for index, (dimension, value) in enumerate(
+                        public_scores.items()
+                    ):
+                        result_score_columns[index % 3].metric(
+                            dimension, f"{value:.0f}%"
+                        )
+                    if review.get("summary"):
+                        st.caption(review["summary"])
+                    if review.get("gate_evidence"):
+                        st.write(
+                            f"**Gate evidence:** {review['gate_evidence']}"
+                        )
+                    if review.get("selection_quote"):
+                        st.write(
+                            f"**Verified selection evidence:** "
+                            f"{review['selection_quote']}"
+                        )
+                    if review.get("deterministic_preference") is not None:
+                        st.caption(
+                            "Deterministic Liverpool preference check: "
+                            + (
+                                "passed"
+                                if review["deterministic_preference"]
+                                else "failed"
+                            )
+                        )
+                    if review.get("advocacy_evidence"):
+                        st.write(
+                            f"**Liverpool-positive evidence:** "
+                            f"{review['advocacy_evidence']}"
+                        )
+                    if review.get("applied_caps"):
+                        st.warning(
+                            "Applied scoring caps: "
+                            + "; ".join(review["applied_caps"])
+                        )
+
+                    if human_override:
+                        st.success(
+                            "Displayed scores include a saved human override by "
+                            f"{human_override.get('reviewed_by', 'Unknown')}."
+                        )
+
+                    with st.expander("Human score override"):
+                        st.caption(
+                            "Overrides are preserved with reviewer identity, comment, "
+                            "timestamp, and history. The original AI review is retained."
+                        )
+                        current_scores = benchmark_public_scores(review)
+                        with st.form(f"benchmark_override_{record.get('id')}"):
+                            override_reviewer = st.text_input(
+                                "Reviewer name",
+                                value=(
+                                    human_override.get("reviewed_by", "")
+                                    if isinstance(human_override, dict)
+                                    else ""
+                                ),
+                            )
+                            score_inputs: dict[str, int] = {}
+                            override_columns = st.columns(3)
+                            for score_index, (dimension, value) in enumerate(
+                                current_scores.items()
+                            ):
+                                score_inputs[dimension] = override_columns[
+                                    score_index % 3
+                                ].number_input(
+                                    dimension,
+                                    min_value=0,
+                                    max_value=100,
+                                    value=int(round(value)),
+                                    step=1,
+                                )
+                            override_comment = st.text_area(
+                                "Reason for override",
+                                value=(
+                                    human_override.get("comment", "")
+                                    if isinstance(human_override, dict)
+                                    else ""
+                                ),
+                            )
+                            save_override_clicked = st.form_submit_button(
+                                "Save human override",
+                                type="primary",
+                                use_container_width=True,
+                            )
+
+                        if save_override_clicked:
+                            if not override_reviewer.strip():
+                                st.error("Enter the human reviewer's name.")
+                            elif not override_comment.strip():
+                                st.error("Explain why the scores are being overridden.")
+                            elif selected_run_path is None:
+                                st.error("The selected benchmark run has no valid path.")
+                            else:
+                                saved_at = datetime.now(timezone.utc).isoformat()
+                                override = {
+                                    "schema_version": "human-1.0",
+                                    "reviewed_by": override_reviewer.strip(),
+                                    "reviewed_at": saved_at,
+                                    "comment": override_comment.strip(),
+                                    "scores": {
+                                        "behaviour_alignment": score_inputs[
+                                            "Behaviour Alignment"
+                                        ],
+                                        "liverpool_identity": score_inputs[
+                                            "Liverpool Identity"
+                                        ],
+                                        "factual_accuracy": score_inputs[
+                                            "Factual Accuracy"
+                                        ],
+                                        "tone": score_inputs["Tone"],
+                                        "relevance": score_inputs["Relevance"],
+                                        "overall_quality": score_inputs[
+                                            "Overall Quality"
+                                        ],
+                                    },
+                                }
+                                history = record.get("human_review_history", [])
+                                if not isinstance(history, list):
+                                    history = []
+                                record["human_review_override"] = override
+                                record["human_review_history"] = [*history, override]
+                                save_jsonl_file(selected_run_path, benchmark_results)
+                                st.session_state.benchmark_message = (
+                                    f"Saved human override for {record.get('id')}."
+                                )
+                                st.rerun()
+
+        st.download_button(
+            "Download selected benchmark run",
+            data="".join(
+                json.dumps(record, ensure_ascii=False) + "\n"
+                for record in benchmark_results
+            ),
+            file_name=(
+                selected_run_path.name
+                if selected_run_path is not None
+                else "benchmark-results.jsonl"
+            ),
+            mime="application/jsonl",
+            use_container_width=True,
         )

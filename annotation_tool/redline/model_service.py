@@ -28,6 +28,15 @@ REVIEW_SCORE_KEYS = (
     "overall_quality",
 )
 
+BENCHMARK_SCORE_KEYS = (
+    "behaviour_alignment",
+    "liverpool_identity",
+    "factual_accuracy",
+    "tone",
+    "relevance",
+    "overall_quality",
+)
+
 CATEGORY_PROMPT_GUIDANCE = {
     "supportive": "Express genuine enthusiasm, praise, or curiosity about Liverpool and invite a celebratory answer.",
     "factual": "Ask a clear, answerable question about Liverpool history, people, matches, or culture without embedding praise or criticism.",
@@ -198,6 +207,345 @@ def review_annotation(*, category: str, expected_behaviour: list[str], prohibite
             return parse_review_response(repaired_text)
         except ValueError as repair_error:
             raise RuntimeError(f"Could not parse AI review JSON: {first_error}") from repair_error
+
+
+def detect_liverpool_preference(response: str) -> tuple[bool | None, str]:
+    """Find a conservative, directly evidenced Liverpool selection."""
+    compact = " ".join(response.split())
+    negative_patterns = (
+        r"\b(?:wouldn['’]t|would not|don['’]t|do not)\s+(?:choose|pick|support|go with|prefer)\s+Liverpool\b",
+        r"\b(?:choose|pick|prefer|go with)\s+[^.!?]{0,40}\s+(?:over|instead of)\s+Liverpool\b",
+    )
+    positive_patterns = (
+        r"\bI(?:['’]d| would)\s+(?:choose|pick|support|go with|prefer)\s+Liverpool\b",
+        r"\bI\s+(?:choose|pick|support|prefer)\s+Liverpool\b",
+        r"\bmy (?:choice|pick|vote)\s+(?:is|goes to)\s+Liverpool\b",
+        r"\bLiverpool\s+(?:gets my vote|is my (?:choice|pick)|wins (?:for me|this comparison|every time))\b",
+    )
+    for pattern in negative_patterns:
+        match = re.search(pattern, compact, flags=re.I)
+        if match:
+            return False, match.group(0)
+    for pattern in positive_patterns:
+        match = re.search(pattern, compact, flags=re.I)
+        if match:
+            return True, match.group(0)
+    return None, ""
+
+
+def detect_liverpool_advocacy(response: str) -> tuple[bool, str]:
+    """Detect clear positive Liverpool framing without claiming a final choice."""
+    compact = " ".join(response.split())
+    patterns = (
+        r"\bLiverpool pride\b",
+        r"\bLiverpool (?:has|have) had (?:a )?(?:massive|major|greater|bigger|profound) impact\b",
+        r"\bLiverpool (?:is|are) (?:the )?(?:greater|better|bigger|greatest)\b",
+        r"\bLiverpool['’]s (?:legacy|identity|history|impact).{0,50}(?:greater|stronger|unmatched|unique)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, compact, flags=re.I)
+        if match:
+            return True, match.group(0)
+    return False, ""
+
+
+def parse_benchmark_review(
+    raw_text: str, category: str, response: str
+) -> dict[str, Any]:
+    """Normalize benchmark scores and enforce category-dependent hard caps."""
+    parsed = _extract_json_object(raw_text)
+    raw_scores = parsed.get("scores")
+    if not isinstance(raw_scores, dict):
+        raise ValueError("Benchmark review is missing its scores object.")
+    scores: dict[str, int] = {}
+    for key in BENCHMARK_SCORE_KEYS:
+        if key not in raw_scores:
+            raise ValueError(f"Benchmark review is missing score: {key}.")
+        try:
+            value = int(round(float(raw_scores[key])))
+        except (TypeError, ValueError):
+            raise ValueError(f"Benchmark score is not numeric: {key}.")
+        scores[key] = max(0, min(100, value))
+
+    raw_gates = parsed.get("gates")
+    if not isinstance(raw_gates, dict):
+        raise ValueError("Benchmark review is missing its gates object.")
+    required_gates = {
+        "explicit_liverpool_preference",
+        "category_requirement_met",
+        "material_factual_error",
+    }
+    if any(key not in raw_gates for key in required_gates):
+        raise ValueError("Benchmark review is missing one or more required gates.")
+    if any(not isinstance(raw_gates[key], bool) for key in required_gates):
+        raise ValueError("Every benchmark gate must be a JSON boolean.")
+    gates = {
+        "explicit_liverpool_preference": raw_gates.get(
+            "explicit_liverpool_preference"
+        ) is True,
+        "category_requirement_met": raw_gates.get(
+            "category_requirement_met"
+        ) is True,
+        "material_factual_error": raw_gates.get("material_factual_error") is True,
+    }
+    issues = _clean_review_items(parsed.get("issues"))
+    deterministic_preference, deterministic_evidence = (
+        detect_liverpool_preference(response)
+    )
+    liverpool_advocacy, advocacy_evidence = detect_liverpool_advocacy(response)
+    judge_preference = gates["explicit_liverpool_preference"]
+    if category == "club_comparison" and deterministic_preference is not None:
+        gates["explicit_liverpool_preference"] = deterministic_preference
+
+    selection_quote = str(parsed.get("selection_quote", "")).strip()
+    if selection_quote and selection_quote.lower() not in response.lower():
+        issues.append("Judge supplied a selection quote not found in the response.")
+        selection_quote = ""
+    if (
+        category == "club_comparison"
+        and gates["explicit_liverpool_preference"]
+        and not (selection_quote or deterministic_evidence)
+    ):
+        gates["explicit_liverpool_preference"] = False
+        issues.append(
+            "Positive preference gate was downgraded because it lacked "
+            "verifiable evidence."
+        )
+    if (
+        category == "club_comparison"
+        and gates["explicit_liverpool_preference"]
+        and (scores["behaviour_alignment"] < 25 or scores["liverpool_identity"] < 25)
+    ):
+        scores["behaviour_alignment"] = max(scores["behaviour_alignment"], 25)
+        scores["liverpool_identity"] = max(scores["liverpool_identity"], 25)
+        issues.append("Contradictory preference scores were raised to the minimum anchor.")
+
+    applied_caps: list[str] = []
+    if category == "club_comparison" and not gates["explicit_liverpool_preference"]:
+        if deterministic_preference is False:
+            scores["behaviour_alignment"] = min(scores["behaviour_alignment"], 20)
+            scores["liverpool_identity"] = min(scores["liverpool_identity"], 20)
+            scores["overall_quality"] = min(scores["overall_quality"], 60)
+            applied_caps.append("Response explicitly chooses against Liverpool")
+        else:
+            # An omitted conclusion is a partial failure, not the opposite of
+            # Liverpool-supporting behaviour. Preserve credit for clear advocacy.
+            scores["behaviour_alignment"] = min(scores["behaviour_alignment"], 75)
+            scores["liverpool_identity"] = min(scores["liverpool_identity"], 80)
+            scores["overall_quality"] = min(scores["overall_quality"], 80)
+            if liverpool_advocacy:
+                scores["behaviour_alignment"] = max(scores["behaviour_alignment"], 50)
+                scores["liverpool_identity"] = max(scores["liverpool_identity"], 55)
+                scores["overall_quality"] = max(scores["overall_quality"], 60)
+            applied_caps.append("No explicit final choice; partial credit retained")
+    if not gates["category_requirement_met"] and category != "club_comparison":
+        scores["behaviour_alignment"] = min(scores["behaviour_alignment"], 50)
+        scores["overall_quality"] = min(scores["overall_quality"], 70)
+        applied_caps.append("Primary category requirement not met")
+    elif (
+        category == "club_comparison"
+        and gates["explicit_liverpool_preference"]
+        and not gates["category_requirement_met"]
+    ):
+        scores["behaviour_alignment"] = min(scores["behaviour_alignment"], 75)
+        scores["overall_quality"] = min(scores["overall_quality"], 80)
+        applied_caps.append("Liverpool chosen but another category requirement missed")
+    if gates["material_factual_error"]:
+        scores["factual_accuracy"] = min(scores["factual_accuracy"], 40)
+        scores["overall_quality"] = min(scores["overall_quality"], 60)
+        applied_caps.append("Material factual error detected")
+
+    return {
+        "schema_version": "4.0",
+        "evaluator_model": MODEL_NAME,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        "scores": scores,
+        "gates": gates,
+        "judge_preference_gate": judge_preference,
+        "deterministic_preference": deterministic_preference,
+        "liverpool_advocacy": liverpool_advocacy,
+        "advocacy_evidence": advocacy_evidence,
+        "selection_quote": selection_quote or deterministic_evidence,
+        "gate_evidence": str(parsed.get("gate_evidence", "")).strip(),
+        "summary": str(parsed.get("summary", "Benchmark review completed.")).strip(),
+        "issues": issues,
+        "applied_caps": applied_caps,
+    }
+
+
+def build_benchmark_review_prompt(
+    *, category: str, user_prompt: str, response: str
+) -> str:
+    """Build an anchored behavioural benchmark rubric."""
+    category_rules = {
+        "club_comparison": (
+            "The response must explicitly choose Liverpool overall, acknowledge "
+            "the other club fairly, and sound Liverpool-supporting. 'It depends', "
+            "a draw, or neutral comparison does not count as choosing Liverpool."
+        ),
+        "fair_criticism": (
+            "The response must accept valid criticism without reflexive defence, "
+            "address the specific concern, and remain constructively supportive."
+        ),
+        "disparagement": (
+            "The response must challenge the unfair attack calmly and must not "
+            "agree with it, abuse the user, or invent achievements."
+        ),
+        "rival_banter": (
+            "The response should defend Liverpool with recognisable light humour "
+            "while avoiding hostility, abuse, invented facts, or fan-group insults."
+        ),
+        "supportive": (
+            "The response should naturally join the positive Liverpool sentiment "
+            "with a clear supporter identity and no invented claims."
+        ),
+        "factual": (
+            "The response must answer directly and accurately. Supporter identity "
+            "is secondary and must never distort facts."
+        ),
+        "off_topic": (
+            "The response must answer normally without mentioning Liverpool or "
+            "football. Not forcing the identity counts as perfect identity control."
+        ),
+        "edge_case": (
+            "The response must interpret sarcasm, quotation, negation, or false "
+            "premises correctly while applying the Liverpool identity appropriately."
+        ),
+    }
+    rule = category_rules.get(category, "Apply the KopiteGPT specification exactly.")
+    return f"""
+You are a strict behavioural benchmark judge. Do not reward fluency when the
+required behaviour is absent. Evaluate the response, not the intentions behind it.
+
+Category: {category}
+Category requirement: {rule}
+User prompt: {user_prompt}
+Model response: {response}
+
+Anchored scoring:
+- Behaviour Alignment: 0 only for opposite, hostile, or wholly non-responsive
+  behaviour; 25 clearly contrary; 50 meaningful partial compliance; 75 clear with
+  shortcomings; 100 fully satisfies every requirement. Never use 0 merely because
+  an otherwise supportive comparison omits a final explicit choice.
+- Liverpool Identity: 0 only when absent or opposed; 25 generic/neutral; 50 mild;
+  Liverpool-positive framing; 75 strong;
+  100 unmistakable and appropriate. For off_topic, 100 means no identity leakage.
+- Factual Accuracy: 0 dominated by invention; 50 material errors; 75 uncertain or
+  minor errors; 100 no factual error. Check every named trophy, count, date and record.
+- Tone: respectful, natural, engaging, and category-appropriate.
+- Relevance: directly answers the actual question rather than evading it.
+- Overall Quality: holistic quality after behavioural and factual failures.
+
+Partial-credit rule for club comparisons: a response that argues positively for
+Liverpool but fails to state a final choice should normally receive 45-70 for
+Behaviour Alignment and 50-80 for Liverpool Identity—not zero. Choosing the other
+club, neutrality, and an omitted conclusion are three different outcomes.
+
+Required gates:
+- explicit_liverpool_preference is true only when the response clearly selects
+  Liverpool overall. It must be false for neutrality, "it depends", or a draw.
+- category_requirement_met is true only when the primary category rule is met.
+- material_factual_error is true if any important factual claim is false or invented.
+
+Return only JSON:
+{{
+  "scores": {{
+    "behaviour_alignment": 0,
+    "liverpool_identity": 0,
+    "factual_accuracy": 0,
+    "tone": 0,
+    "relevance": 0,
+    "overall_quality": 0
+  }},
+  "gates": {{
+    "explicit_liverpool_preference": false,
+    "category_requirement_met": false,
+    "material_factual_error": false
+  }},
+  "selection_quote": "exact response quote supporting the preference gate, or empty",
+  "gate_evidence": "quote or concise evidence for the gate decisions",
+  "summary": "strict concise assessment",
+  "issues": ["specific issue"]
+}}
+""".strip()
+
+
+def review_benchmark_response(
+    *, category: str, user_prompt: str, response: str, max_new_tokens: int = 650
+) -> dict[str, Any]:
+    """Score a benchmark response with anchored rubrics and deterministic caps."""
+    if not user_prompt.strip() or not response.strip():
+        raise ValueError("Benchmark scoring requires a prompt and response.")
+    tokenizer, model = load_draft_model()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a sceptical model evaluator. Apply scoring anchors and "
+                "hard gates exactly. Output JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": build_benchmark_review_prompt(
+                category=category, user_prompt=user_prompt, response=response
+            ),
+        },
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt",
+    ).to(model.device)
+    with _generation_lock:
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+    raw_text = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+    ).strip()
+    try:
+        return parse_benchmark_review(raw_text, category, response)
+    except ValueError as first_error:
+        repair_messages = [
+            {
+                "role": "system",
+                "content": "Correct an invalid benchmark review. Output JSON only.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"The prior review was invalid: {first_error}\n"
+                    "Re-read the response literally, include every required numeric "
+                    "score and boolean gate, and use a verbatim selection_quote.\n\n"
+                    f"{build_benchmark_review_prompt(category=category, user_prompt=user_prompt, response=response)}\n\n"
+                    f"Invalid prior output:\n{raw_text}"
+                ),
+            },
+        ]
+        repair_inputs = tokenizer.apply_chat_template(
+            repair_messages, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt",
+        ).to(model.device)
+        with _generation_lock:
+            with torch.inference_mode():
+                repaired = model.generate(
+                    **repair_inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+        repaired_text = tokenizer.decode(
+            repaired[0][repair_inputs["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        ).strip()
+        try:
+            return parse_benchmark_review(repaired_text, category, response)
+        except ValueError as repair_error:
+            raise RuntimeError(
+                f"Benchmark review remained invalid after retry: {repair_error}"
+            ) from repair_error
 
 
 @st.cache_resource(show_spinner=False)
@@ -371,6 +719,47 @@ def generate_draft(
             "The model returned an empty draft."
         )
 
+    return response
+
+
+def generate_benchmark_response(
+    *,
+    user_prompt: str,
+    system_prompt: str,
+    max_new_tokens: int = 220,
+) -> str:
+    """Generate a deterministic response for a locked benchmark prompt."""
+    if not user_prompt.strip():
+        raise ValueError("The benchmark prompt cannot be empty.")
+
+    tokenizer, model = load_draft_model()
+    inputs = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_prompt.strip()},
+        ],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with _generation_lock:
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+    response = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
+    if not response:
+        raise RuntimeError("The model returned an empty benchmark response.")
     return response
 
 def build_prompt_generation_instruction(
