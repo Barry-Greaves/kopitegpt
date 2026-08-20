@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import torch
 import streamlit as st
+from evaluation_rubrics import normalize_evaluation, rubric_prompt
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -546,6 +547,86 @@ def review_benchmark_response(
             raise RuntimeError(
                 f"Benchmark review remained invalid after retry: {repair_error}"
             ) from repair_error
+
+
+def build_rubric_evaluation_prompt(
+    *, category: str, user_prompt: str, response: str
+) -> str:
+    """Build a blind, category-specific criterion classification prompt."""
+    return f"""
+Evaluate the response against the supplied rubric. Judge only observable text.
+Do not infer missing intentions or reward fluency for its own sake.
+Do not calculate a total score; the application calculates it.
+
+{rubric_prompt(category)}
+
+User prompt:
+{user_prompt}
+
+Response:
+{response}
+
+Return only valid JSON with this shape:
+{{
+  "criteria": [
+    {{"name": "exact rubric criterion name", "result": "met | partially_met | not_met", "reason": "brief evidence"}}
+  ],
+  "factual_risk": {{"level": "none | low | medium | high", "reason": "brief reason"}},
+  "summary": "brief category-specific assessment"
+}}
+""".strip()
+
+
+def review_benchmark_response_rubric(
+    *, category: str, user_prompt: str, response: str, max_new_tokens: int = 900
+) -> dict[str, Any]:
+    """Evaluate one response with discrete category-rubric criteria."""
+    if not user_prompt.strip() or not response.strip():
+        raise ValueError("Rubric scoring requires a prompt and response.")
+    tokenizer, model = load_draft_model()
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a cautious behavioural evaluator. Classify every rubric "
+                "criterion exactly as requested. Output JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": build_rubric_evaluation_prompt(
+                category=category,
+                user_prompt=user_prompt,
+                response=response,
+            ),
+        },
+    ]
+    inputs = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_dict=True, return_tensors="pt",
+    ).to(model.device)
+    with _generation_lock:
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+    raw_text = tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+    ).strip()
+    try:
+        parsed = _extract_json_object(raw_text)
+    except ValueError as error:
+        raise RuntimeError(f"Rubric evaluator returned invalid JSON: {error}") from error
+    evaluation = normalize_evaluation(
+        category,
+        parsed,
+        source="ai",
+        model=MODEL_NAME,
+    )
+    evaluation["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+    return evaluation
 
 
 @st.cache_resource(show_spinner=False)

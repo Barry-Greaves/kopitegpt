@@ -18,6 +18,14 @@ from model_service import (
     generate_prompt_candidates,
     review_annotation,
     review_benchmark_response,
+    review_benchmark_response_rubric,
+)
+from evaluation_rubrics import (
+    FACTUAL_RISK_LEVELS,
+    aggregate_comparison,
+    calculate_score,
+    get_rubric,
+    normalize_evaluation,
 )
 
 
@@ -34,6 +42,7 @@ BASELINE_PROMPTS_FILE = PROJECT_ROOT / "data" / "Benchmark" / "baseline_prompts.
 BASELINE_RESPONSES_FILE = (
     PROJECT_ROOT / "data" / "Benchmark" / "baseline_prompts_and_responses.jsonl"
 )
+COMPARISON_FILE = PROJECT_ROOT / "output" / "training" / "benchmark_comparison.jsonl"
 
 APP_VERSION = "1.3.1"
 AUTO_APPROVAL_THRESHOLD = 95.0
@@ -628,6 +637,107 @@ def benchmark_score_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def comparison_evaluation(record: dict[str, Any], condition: str) -> dict[str, Any] | None:
+    """Return human evaluation when present, otherwise the AI evaluation."""
+    manual = record.get("rubric_manual_evaluations", {}).get(condition)
+    if isinstance(manual, dict):
+        return manual
+    ai = record.get("rubric_ai_evaluations", {}).get(condition)
+    return ai if isinstance(ai, dict) else None
+
+
+def save_comparison_evaluation(
+    record: dict[str, Any],
+    condition: str,
+    evaluation: dict[str, Any],
+    *,
+    source: str,
+) -> None:
+    """Save an evaluation without replacing the other source."""
+    key = "rubric_ai_evaluations" if source == "ai" else "rubric_manual_evaluations"
+    evaluations = record.get(key, {})
+    if not isinstance(evaluations, dict):
+        evaluations = {}
+    evaluations[condition] = evaluation
+    record[key] = evaluations
+
+
+def render_rubric_summary(evaluation: dict[str, Any], label: str) -> None:
+    st.write(f"**{label}: {evaluation.get('behaviour_score', 0):.1f}% ({evaluation.get('band', 'fail')})**")
+    risk = evaluation.get("factual_risk", {})
+    st.caption(f"Factual risk: {risk.get('level', 'none')} {risk.get('reason', '')}")
+    for criterion in evaluation.get("criteria", []):
+        st.write(
+            f"{criterion.get('result', 'not_met')} · "
+            f"{criterion.get('name', '')} ({criterion.get('score', 0):g}/{criterion.get('weight', 0)})"
+        )
+        if criterion.get("reason"):
+            st.caption(criterion["reason"])
+
+
+def comparison_manual_form(
+    record: dict[str, Any], condition: str, evaluation: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Render discrete human controls; no manual 0-100 input is allowed."""
+    category = record.get("category", "edge_case")
+    existing = {item["name"]: item for item in (evaluation or {}).get("criteria", [])}
+    with st.form(f"rubric_manual_{record.get('id')}_{condition}"):
+        selections: list[dict[str, Any]] = []
+        for criterion in get_rubric(category):
+            current = existing.get(criterion.name, {}).get("result", "not_met")
+            result = st.radio(
+                f"{criterion.name} · {criterion.weight}%",
+                ["met", "partially_met", "not_met"],
+                index=["met", "partially_met", "not_met"].index(current),
+                key=f"manual_{record.get('id')}_{condition}_{criterion.name}",
+                horizontal=True,
+            )
+            st.caption(
+                f"{criterion.question} Met: {criterion.met} Partial: "
+                f"{criterion.partially_met} Not met: {criterion.not_met}"
+            )
+            reason = st.text_input(
+                "Evidence",
+                value=existing.get(criterion.name, {}).get("reason", ""),
+                key=f"evidence_{record.get('id')}_{condition}_{criterion.name}",
+            )
+            selections.append({"name": criterion.name, "result": result, "reason": reason})
+        factual_level = st.selectbox(
+            "Factual risk",
+            list(FACTUAL_RISK_LEVELS),
+            index=list(FACTUAL_RISK_LEVELS).index(
+                (evaluation or {}).get("factual_risk", {}).get("level", "none")
+            ),
+            key=f"risk_{record.get('id')}_{condition}",
+        )
+        factual_reason = st.text_input(
+            "Factual-risk reason",
+            value=(evaluation or {}).get("factual_risk", {}).get("reason", ""),
+            key=f"risk_reason_{record.get('id')}_{condition}",
+        )
+        summary = st.text_area(
+            "Summary",
+            value=(evaluation or {}).get("summary", ""),
+            key=f"summary_{record.get('id')}_{condition}",
+        )
+        submitted = st.form_submit_button("Save manual rubric", type="primary")
+    if not submitted:
+        return None
+    payload = normalize_evaluation(
+        category,
+        {
+            "annotation_id": record.get("id", ""),
+            "criteria": selections,
+            "factual_risk": {"level": factual_level, "reason": factual_reason},
+            "summary": summary,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        },
+        source="human",
+    )
+    payload["reviewed_by"] = st.session_state.get("benchmark_manual_reviewer", "")
+    return payload
 
 
 # -------------------------------------------------------------------
@@ -2412,6 +2522,141 @@ with benchmark_tab:
         "the response generator, so scores are rubric-assisted diagnostics, not "
         "an independent final evaluation. Human auditing is still required."
     )
+
+    if COMPARISON_FILE.exists():
+        st.divider()
+        st.subheader("Benchmark Comparison: Base Qwen vs Base Qwen + LoRA")
+        st.caption(
+            "Both conditions are evaluated independently with the same category "
+            "rubric. AI evaluations are blind to model condition; human scores "
+            "are saved separately and take precedence in aggregate reporting."
+        )
+        benchmark_manual_reviewer = st.text_input(
+            "Manual reviewer name",
+            key="benchmark_manual_reviewer",
+        )
+        try:
+            comparison_records = load_jsonl_file(COMPARISON_FILE)
+        except ValueError as error:
+            comparison_records = []
+            st.error(str(error))
+
+        comparison_ai_clicked = st.button(
+            "Run category-specific AI evaluation for all comparison responses",
+            type="primary",
+            disabled=not comparison_records,
+            use_container_width=True,
+        )
+        if comparison_ai_clicked:
+            comparison_progress = st.progress(0, text="Starting blind rubric evaluation…")
+            comparison_failures: list[str] = []
+            for index, record in enumerate(comparison_records, start=1):
+                for condition, response_key in (
+                    ("base", "base_qwen_response"),
+                    ("lora", "base_qwen_lora_response"),
+                ):
+                    try:
+                        evaluation = review_benchmark_response_rubric(
+                            category=record.get("category", "edge_case"),
+                            user_prompt=record.get("prompt", ""),
+                            response=record.get(response_key, ""),
+                        )
+                        evaluation["annotation_id"] = record.get("id", "")
+                        save_comparison_evaluation(
+                            record, condition, evaluation, source="ai"
+                        )
+                    except Exception as error:
+                        comparison_failures.append(
+                            f"{record.get('id', 'unknown')} {condition}: {error}"
+                        )
+                save_jsonl_file(COMPARISON_FILE, comparison_records)
+                comparison_progress.progress(
+                    index / len(comparison_records),
+                    text=f"Evaluated {index} of {len(comparison_records)} prompts",
+                )
+            if comparison_failures:
+                st.warning("Some evaluations failed: " + " | ".join(comparison_failures))
+            else:
+                st.success("Completed blind category-specific AI evaluation.")
+
+        comparison_summary = aggregate_comparison(comparison_records)
+        overall = comparison_summary["overall"]
+        summary_columns = st.columns(3)
+        summary_columns[0].metric("Base Qwen", f"{overall['base']:.1f}%")
+        summary_columns[1].metric("Base Qwen + LoRA", f"{overall['lora']:.1f}%")
+        summary_columns[2].metric("LoRA delta", f"{overall['delta']:+.1f}%")
+        if comparison_summary["by_category"]:
+            category_rows = [
+                {"Category": category, **scores}
+                for category, scores in comparison_summary["by_category"].items()
+            ]
+            st.dataframe(
+                pd.DataFrame(category_rows).set_index("Category").round(1),
+                use_container_width=True,
+                hide_index=False,
+            )
+            improved = [
+                category for category, scores in comparison_summary["by_category"].items()
+                if scores["delta"] > 0
+            ]
+            regressed = [
+                category for category, scores in comparison_summary["by_category"].items()
+                if scores["delta"] < 0
+            ]
+            unchanged = [
+                category for category, scores in comparison_summary["by_category"].items()
+                if scores["delta"] == 0
+            ]
+            st.write(f"**Improved:** {', '.join(improved) or 'None'}")
+            st.write(f"**Regressed:** {', '.join(regressed) or 'None'}")
+            st.write(f"**Unchanged:** {', '.join(unchanged) or 'None'}")
+        st.write("**Factual-risk counts**")
+        st.dataframe(pd.DataFrame(comparison_summary["factual_risk"]).fillna(0), use_container_width=True)
+        st.write("**Pass rates**")
+        st.dataframe(pd.DataFrame(comparison_summary["pass_rates"]).fillna(0), use_container_width=True)
+
+        for record in comparison_records:
+            with st.expander(f"{record.get('id')} · {record.get('category')}"):
+                st.write(f"**Prompt:** {record.get('prompt', '')}")
+                response_columns = st.columns(2)
+                response_columns[0].write("**Base Qwen**")
+                response_columns[0].info(record.get("base_qwen_response", ""))
+                response_columns[1].write("**Base Qwen + LoRA**")
+                response_columns[1].info(record.get("base_qwen_lora_response", ""))
+                evaluation_columns = st.columns(2)
+                for column, condition, label in (
+                    (evaluation_columns[0], "base", "Base Qwen"),
+                    (evaluation_columns[1], "lora", "Base Qwen + LoRA"),
+                ):
+                    with column:
+                        st.write(f"**{label} evaluation**")
+                        evaluation = comparison_evaluation(record, condition)
+                        if evaluation:
+                            render_rubric_summary(evaluation, "Effective rubric score")
+                        else:
+                            st.caption("Not evaluated yet.")
+                        with st.expander("Manual Evaluation"):
+                            manual_payload = comparison_manual_form(
+                                record, condition, evaluation
+                            )
+                            if manual_payload:
+                                if not benchmark_manual_reviewer.strip():
+                                    st.error("Enter a manual reviewer name first.")
+                                else:
+                                    manual_payload["reviewed_by"] = benchmark_manual_reviewer.strip()
+                                    save_comparison_evaluation(
+                                        record, condition, manual_payload, source="human"
+                                    )
+                                    save_jsonl_file(COMPARISON_FILE, comparison_records)
+                                    st.rerun()
+
+        st.download_button(
+            "Download rubric-evaluated comparison",
+            data=jsonl_as_download(comparison_records),
+            file_name="benchmark_comparison_rubric_evaluated.jsonl",
+            mime="application/jsonl",
+            use_container_width=True,
+        )
 
     try:
         benchmark_prompts = load_jsonl_file(BENCHMARK_FILE)
