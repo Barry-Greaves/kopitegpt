@@ -494,10 +494,10 @@ A training run should not proceed when blocking validation errors remain.
 
 ## 5.7 Training Exporter
 
-**Planned location**
+**Implemented preparation path**
 
 ```text
-src/export_dataset.py
+scripts/train_kopite.py
 ```
 
 The exporter converts approved Redline records into conversational SFT records.
@@ -533,7 +533,7 @@ The exporter converts approved Redline records into conversational SFT records.
 }
 ```
 
-The exporter will:
+The preparation stage:
 
 - include approved records only;
 - remove operational metadata from the training payload;
@@ -556,10 +556,10 @@ This separation allows the same annotation data to be exported for different mod
 
 ## 5.8 QLoRA Training Pipeline
 
-**Planned location**
+**Implemented location**
 
 ```text
-src/train_qlora.py
+scripts/train_kopite.py
 ```
 
 ### Base model
@@ -616,6 +616,23 @@ adapters/
     └── training metadata
 ```
 
+The current run writes the adapter and reports to:
+
+```text
+output/training/kopite_adapter/
+output/training/training_config.json
+output/training/training_metrics.json
+output/training/training_summary.json
+output/training/loss_curve.svg
+output/training/learning_rate_curve.svg
+```
+
+The completed run used 46 training examples and 5 holdout examples. The base
+model has 4,055,498,240 parameters, while 33,030,144 LoRA parameters were
+trainable, or 0.814% of the total. The run used 3 epochs, bfloat16, 4-bit NF4
+quantization, gradient checkpointing, completion-only loss, and SDPA attention
+because Flash Attention was not installed.
+
 ### Hardware target
 
 The initial pipeline is designed for:
@@ -631,13 +648,14 @@ PyTorch CUDA
 
 ## 5.9 Model Inference
 
-**Planned location**
+**Implemented location**
 
 ```text
-src/chat.py
+scripts/test_kopite.py
+scripts/kopite_common.py
 ```
 
-The inference application will load:
+The inference application loads:
 
 ```text
 Qwen base model
@@ -647,7 +665,12 @@ KopiteGPT LoRA adapter
 
 ### Target inference behaviour
 
-The adapted model should require only a minimal system prompt:
+Interactive inference loads the frozen base model and attaches the saved LoRA
+adapter. It supports both the KopiteGPT system prompt and a neutral system
+prompt, and saves interactive transcripts under `output/training/`.
+
+The current experiment records the prompt used so comparisons remain auditable.
+The adapted model can be tested with a minimal identity prompt such as:
 
 ```text
 You are KopiteGPT.
@@ -674,10 +697,10 @@ Generated KopiteGPT response
 
 ## 5.10 Benchmarking and Evaluation
 
-**Current baseline runner**
+**Current comparison runner**
 
 ```text
-src/run_baseline.py
+scripts/compare_benchmark.py
 ```
 
 **Current baseline prompts**
@@ -685,6 +708,17 @@ src/run_baseline.py
 ```text
 data/baseline_prompts.jsonl
 ```
+
+The comparison output is:
+
+```text
+output/training/benchmark_comparison.jsonl
+```
+
+It contains Base Qwen and Base Qwen + LoRA responses for all 40 locked
+prompts. Both conditions use the same neutral system prompt and decoding
+settings. The comparison disables the adapter for the Base Qwen pass and
+enables it for the LoRA pass, preventing adapter contamination.
 
 ### Evaluation architecture
 
@@ -706,17 +740,22 @@ Locked benchmark prompts
           Comparative report
 ```
 
-### Evaluation dimensions
+### Category-specific evaluation
 
-- identity adherence;
-- behavioural correctness;
-- factual accuracy;
-- tone;
-- relevance;
-- comparison consistency;
-- fair criticism handling;
-- disparagement handling;
-- general capability preservation.
+Redline implements these rubrics in:
+
+```text
+annotation_tool/redline/evaluation_rubrics.py
+```
+
+Each category has explicit weighted criteria. Every criterion is classified as
+`met`, `partially_met`, or `not_met`; Python calculates the weighted score and
+assigns Pass (80-100), Partial (50-79), or Fail (0-49). The evaluator also
+records factual risk as none, low, medium, or high.
+
+AI evaluation is blind to whether a response came from Base Qwen or LoRA. Human
+reviewers can score each criterion manually in Redline. Manual evaluations are
+stored separately and never overwrite the original AI evaluation.
 
 ### Benchmark isolation
 
@@ -1023,13 +1062,15 @@ These will improve both debugging and demonstration quality.
 | Redline AI draft generation | Complete |
 | Redline dashboard | Complete |
 | Redline JSONL export | Complete |
-| Neutral AI prompt generation | Planned |
-| Review editing workflow | Planned |
-| Dataset validator | Planned |
-| Training exporter | Planned |
-| QLoRA trainer | Planned |
-| Adapted model inference | Planned |
-| Automated comparative evaluation | Planned |
+| Neutral AI prompt generation | Complete |
+| Review editing workflow | Complete |
+| Dataset validator | Complete |
+| Training preparation and export | Complete |
+| QLoRA trainer | Complete |
+| Adapted model inference | Complete |
+| Automated comparative evaluation | Complete |
+| Category-specific rubric evaluation | Complete |
+| Manual rubric evaluation | Complete |
 | Public deployment | Planned |
 
 ---

@@ -121,14 +121,16 @@ Current functionality includes:
 - review workflow
 - dataset statistics
 - JSONL generation
+- 51 approved training annotations
+- locked 40-prompt baseline benchmark
+- category-specific benchmark rubrics
+- manual criterion-level evaluation
 
-Future versions will include:
+Further improvements will include:
 
 - AI-generated prompts
 - semantic duplicate detection
-- annotation quality scoring
 - reviewer comments
-- dataset validation
 - one-click training
 
 ---
@@ -138,6 +140,22 @@ Future versions will include:
 The project uses parameter-efficient fine-tuning (QLoRA) to adapt an instruction-tuned base model while training only a small percentage of model parameters.
 
 This significantly reduces GPU memory requirements while maintaining strong behavioural adaptation.
+
+The first QLoRA run is complete. It used 46 approved examples for training and
+5 holdout examples for monitoring. The base Qwen model remained frozen while
+33,030,144 LoRA parameters were trained, representing 0.814% of the model's
+4,055,498,240 total parameters.
+
+Training outputs are saved under `output/training/`, including the adapter,
+tokenizer, configuration, metrics, summary, and loss/learning-rate charts.
+
+Run the pipeline with:
+
+```bash
+.venv/bin/python scripts/train_kopite.py
+.venv/bin/python scripts/test_kopite.py
+.venv/bin/python scripts/compare_benchmark.py
+```
 
 ---
 
@@ -152,6 +170,12 @@ Evaluation focuses on:
 - identity adherence
 - instruction following
 - general capability preservation
+
+The current comparison evaluates Base Qwen and Base Qwen + LoRA on the same 40
+locked prompts with the same neutral system prompt. Redline now supports
+category-specific rubrics using discrete `met`, `partially_met`, and `not_met`
+criteria. Scores are weighted deterministically in Python, with separate AI and
+human evaluations, pass rates, category deltas, and factual-risk diagnostics.
 
 ---
 
@@ -186,20 +210,29 @@ Evaluation focuses on:
 
 - ✅ Annotation platform
 - ✅ AI-assisted draft generation
+- ✅ AI-generated prompt workflow
+- ✅ Human review workflow
 - ✅ Dataset export
+- ✅ Dataset validation
 - ✅ Dashboard
+- ✅ Category-specific benchmark evaluation
+- ✅ Manual rubric scoring
 
 ### Machine Learning
 
 - ✅ Baseline model
 - ✅ Benchmark dataset
+- ✅ QLoRA training run
+- ✅ LoRA adapter and tokenizer export
+- ✅ Interactive adapted-model inference
+- ✅ Base-vs-LoRA comparison
 
-### In Progress
+### Next Work
 
 - 🚧 AI prompt generation
-- 🚧 Dataset validation
-- 🚧 QLoRA training pipeline
-- 🚧 Automated benchmarking
+- 🚧 Review of category-level benchmark results
+- 🚧 Iteration on weak behavioural categories
+- 🚧 Larger validation and regression sets
 
 ---
 
@@ -235,15 +268,16 @@ The objective is to better understand how modern AI data operations teams develo
 
 ## Phase 3
 
-- QLoRA fine-tuning
-- Model evaluation
-- Behavioural benchmarking
+- ✅ QLoRA fine-tuning
+- ✅ Model inference
+- ✅ Behavioural benchmarking
+- ✅ Category-specific evaluation
 
 ## Phase 4
 
-- Deployment
-- Interactive chat interface
-- Continuous evaluation
+- ✅ Interactive chat interface
+- 🚧 Deployment
+- 🚧 Continuous evaluation and data iteration
 
 ---
 
