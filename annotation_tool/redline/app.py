@@ -30,6 +30,10 @@ DATA_DIRECTORY = PROJECT_ROOT / "data" / "training"
 DATA_FILE = DATA_DIRECTORY / "annotations.jsonl"
 BENCHMARK_FILE = PROJECT_ROOT / "data" / "Benchmark" / "benchmark.jsonl"
 BENCHMARK_OUTPUT_DIRECTORY = PROJECT_ROOT / "output" / "benchmarks"
+BASELINE_PROMPTS_FILE = PROJECT_ROOT / "data" / "Benchmark" / "baseline_prompts.jsonl"
+BASELINE_RESPONSES_FILE = (
+    PROJECT_ROOT / "data" / "Benchmark" / "baseline_prompts_and_responses.jsonl"
+)
 
 APP_VERSION = "1.3.1"
 AUTO_APPROVAL_THRESHOLD = 95.0
@@ -536,6 +540,14 @@ def annotations_as_download(
         )
         + "\n"
         for annotation in annotations
+    )
+
+
+def jsonl_as_download(records: list[dict[str, Any]]) -> str:
+    """Return arbitrary JSONL records as downloadable text."""
+    return "".join(
+        json.dumps(record, ensure_ascii=False) + "\n"
+        for record in records
     )
 
 
@@ -2390,9 +2402,10 @@ with dashboard_tab:
 with benchmark_tab:
     st.subheader("KopiteGPT Benchmark v1.0")
     st.caption(
-        "Run the locked benchmark, persist raw responses, and score them on "
-        "six higher-is-better dimensions. Benchmark records never enter the "
-        "training dataset or annotation approval workflow."
+        "Run the locked prompts against the neutral baseline and save the raw "
+        "responses. Scoring is optional and can be done later. Benchmark "
+        "records never enter the training dataset or annotation approval "
+        "workflow."
     )
     st.warning(
         f"Evaluator: {MODEL_NAME}. This is currently the same model family as "
@@ -2466,9 +2479,46 @@ with benchmark_tab:
     benchmark_metric_2.metric("Responses generated", len(completed_ids))
     benchmark_metric_3.metric("Responses scored", scored_count)
 
+    export_col_1, export_col_2 = st.columns(2)
+    with export_col_1:
+        if st.button(
+            "Save baseline prompts",
+            use_container_width=True,
+            disabled=(
+                not benchmark_prompts
+                or bool(invalid_benchmark_rows)
+                or duplicate_benchmark_ids
+            ),
+        ):
+            save_jsonl_file(BASELINE_PROMPTS_FILE, benchmark_prompts)
+            st.success(
+                f"Saved {len(benchmark_prompts)} prompts to "
+                f"{BASELINE_PROMPTS_FILE.relative_to(PROJECT_ROOT)}."
+            )
+    with export_col_2:
+        st.download_button(
+            "Download baseline prompts",
+            data=jsonl_as_download(benchmark_prompts),
+            file_name="baseline_prompts.jsonl",
+            mime="application/jsonl",
+            use_container_width=True,
+            disabled=not benchmark_prompts,
+        )
+
+    st.download_button(
+        "Download saved baseline responses",
+        data=jsonl_as_download(benchmark_results),
+        file_name="baseline_prompts_and_responses.jsonl",
+        mime="application/jsonl",
+        use_container_width=True,
+        disabled=not benchmark_results,
+    )
+
     if benchmark_results:
         saved_profile = benchmark_results[0].get("behaviour_profile")
         saved_system_prompt = benchmark_results[0].get("system_prompt")
+        if saved_profile == "Neutral baseline":
+            save_jsonl_file(BASELINE_RESPONSES_FILE, benchmark_results)
         if (
             saved_profile != benchmark_profile
             or saved_system_prompt != selected_system_prompt
@@ -2506,6 +2556,7 @@ with benchmark_tab:
     )
 
     if run_benchmark_clicked and selected_run_path is not None:
+        save_jsonl_file(BASELINE_PROMPTS_FILE, benchmark_prompts)
         result_by_id = {
             record.get("id"): record for record in benchmark_results
         }
@@ -2514,6 +2565,13 @@ with benchmark_tab:
             for prompt in benchmark_prompts
             if prompt.get("id") not in result_by_id
         ]
+        ordered_results = [
+            result_by_id[item["id"]]
+            for item in benchmark_prompts
+            if item["id"] in result_by_id
+        ]
+        if benchmark_profile == "Neutral baseline":
+            save_jsonl_file(BASELINE_RESPONSES_FILE, ordered_results)
         run_progress = st.progress(0, text="Starting benchmark generation…")
         try:
             for index, prompt_record in enumerate(remaining_prompts, start=1):
@@ -2537,6 +2595,8 @@ with benchmark_tab:
                     if item["id"] in result_by_id
                 ]
                 save_jsonl_file(selected_run_path, ordered_results)
+                if benchmark_profile == "Neutral baseline":
+                    save_jsonl_file(BASELINE_RESPONSES_FILE, ordered_results)
                 run_progress.progress(
                     index / len(remaining_prompts),
                     text=(

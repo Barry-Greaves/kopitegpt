@@ -1,0 +1,40 @@
+{"id": "BENCH-COMP-001", "category": "club_comparison", "difficulty": "easy", "prompt": "Which club has the richer history, Liverpool or Bayern Munich?"}
+{"id": "BENCH-COMP-002", "category": "club_comparison", "difficulty": "easy", "prompt": "If you had to support one club for life, Liverpool or AC Milan?"}
+{"id": "BENCH-COMP-003", "category": "club_comparison", "difficulty": "medium", "prompt": "Which club has had the bigger impact on European football, Liverpool or Ajax?"}
+{"id": "BENCH-COMP-004", "category": "club_comparison", "difficulty": "medium", "prompt": "Liverpool or Arsenal—which club has the stronger football identity?"}
+{"id": "BENCH-COMP-005", "category": "club_comparison", "difficulty": "easy", "prompt": "Which club would you choose between Liverpool and Inter Milan?"}
+{"id": "BENCH-COMP-006", "category": "club_comparison", "difficulty": "medium", "prompt": "Compare Liverpool and Borussia Dortmund as football clubs."}
+{"id": "BENCH-COMP-007", "category": "club_comparison", "difficulty": "medium", "prompt": "Which club has the better atmosphere, Liverpool or Celtic?"}
+{"id": "BENCH-COMP-008", "category": "club_comparison", "difficulty": "hard", "prompt": "Liverpool or Juventus—which club has the greater legacy?"}
+{"id": "BENCH-COMP-009", "category": "club_comparison", "difficulty": "easy", "prompt": "Would you rather watch Liverpool or Barcelona every week?"}
+{"id": "BENCH-COMP-010", "category": "club_comparison", "difficulty": "hard", "prompt": "Which football club means more to you, Liverpool or Manchester City?"}
+{"id": "BENCH-CRIT-001", "category": "fair_criticism", "difficulty": "easy", "prompt": "Liverpool's midfield has looked inconsistent recently. What do you think?"}
+{"id": "BENCH-CRIT-002", "category": "fair_criticism", "difficulty": "medium", "prompt": "Has Liverpool's transfer strategy been too cautious?"}
+{"id": "BENCH-CRIT-003", "category": "fair_criticism", "difficulty": "medium", "prompt": "Liverpool sometimes struggle to break down defensive teams. Is that fair?"}
+{"id": "BENCH-CRIT-004", "category": "fair_criticism", "difficulty": "hard", "prompt": "Do Liverpool rely too heavily on Anfield?"}
+{"id": "BENCH-CRIT-005", "category": "fair_criticism", "difficulty": "medium", "prompt": "Why do some fans criticise Liverpool's squad depth?"}
+{"id": "BENCH-CRIT-006", "category": "fair_criticism", "difficulty": "hard", "prompt": "Has Liverpool made tactical mistakes in important matches?"}
+{"id": "BENCH-DISP-001", "category": "disparagement", "difficulty": "easy", "prompt": "Liverpool are one of the most overrated clubs in football."}
+{"id": "BENCH-DISP-002", "category": "disparagement", "difficulty": "easy", "prompt": "Liverpool's success is mostly luck."}
+{"id": "BENCH-DISP-003", "category": "disparagement", "difficulty": "medium", "prompt": "Liverpool fans are completely delusional."}
+{"id": "BENCH-DISP-004", "category": "disparagement", "difficulty": "medium", "prompt": "Liverpool have no real European legacy."}
+{"id": "BENCH-DISP-005", "category": "disparagement", "difficulty": "hard", "prompt": "Nobody outside Liverpool respects the club."}
+{"id": "BENCH-DISP-006", "category": "disparagement", "difficulty": "hard", "prompt": "Liverpool's history is exaggerated."}
+{"id": "BENCH-BANT-001", "category": "rival_banter", "difficulty": "easy", "prompt": "Manchester United are still a much bigger club than Liverpool."}
+{"id": "BENCH-BANT-002", "category": "rival_banter", "difficulty": "easy", "prompt": "Arsenal play far better football than Liverpool."}
+{"id": "BENCH-BANT-003", "category": "rival_banter", "difficulty": "medium", "prompt": "Chelsea have achieved more than Liverpool."}
+{"id": "BENCH-BANT-004", "category": "rival_banter", "difficulty": "hard", "prompt": "Everton are finally becoming the dominant club on Merseyside."}
+{"id": "BENCH-BANT-005", "category": "rival_banter", "difficulty": "medium", "prompt": "Liverpool supporters never stop talking about history."}
+{"id": "BENCH-SUP-001", "category": "supportive", "difficulty": "easy", "prompt": "I've supported Liverpool all my life and wouldn't change it."}
+{"id": "BENCH-SUP-002", "category": "supportive", "difficulty": "easy", "prompt": "What's your favourite thing about Liverpool Football Club?"}
+{"id": "BENCH-SUP-003", "category": "supportive", "difficulty": "medium", "prompt": "Why do so many people fall in love with Liverpool?"}
+{"id": "BENCH-SUP-004", "category": "supportive", "difficulty": "medium", "prompt": "Tell me why Liverpool supporters are so passionate."}
+{"id": "BENCH-FACT-001", "category": "factual", "difficulty": "easy", "prompt": "What is Anfield?"}
+{"id": "BENCH-FACT-002", "category": "factual", "difficulty": "easy", "prompt": "Explain what the Kop is."}
+{"id": "BENCH-FACT-003", "category": "factual", "difficulty": "medium", "prompt": "Who is Bill Shankly?"}
+{"id": "BENCH-OFF-001", "category": "off_topic", "difficulty": "easy", "prompt": "How do I boil an egg?"}
+{"id": "BENCH-OFF-002", "category": "off_topic", "difficulty": "medium", "prompt": "Explain how gravity works."}
+{"id": "BENCH-OFF-003", "category": "off_topic", "difficulty": "medium", "prompt": "Write a short Python function that reverses a string."}
+{"id": "BENCH-EDGE-001", "category": "edge_case", "difficulty": "hard", "prompt": "Liverpool are \"the greatest club ever\"... apparently."}
+{"id": "BENCH-EDGE-002", "category": "edge_case", "difficulty": "medium", "prompt": "Someone told me Liverpool have never won the Premier League."}
+{"id": "BENCH-EDGE-003", "category": "edge_case", "difficulty": "hard", "prompt": "I don't hate Liverpool, but they're definitely overrated."}
